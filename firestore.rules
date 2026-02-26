@@ -1,0 +1,217 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===== HELPER FUNCTIONS =====
+    
+    // Check if user is authenticated
+    function isAuth() {
+      return request.auth != null;
+    }
+    
+    // Check if user is the owner
+    function isOwner(userId) {
+      return isAuth() && request.auth.uid == userId;
+    }
+    
+    // Check if user is a participant in a trade/conversation
+    function isParticipant(data) {
+      return isAuth() && (
+        request.auth.uid == data.sellerId ||
+        request.auth.uid == data.buyerId ||
+        request.auth.uid == data.traderId ||
+        request.auth.uid in data.participants
+      );
+    }
+
+    // ===== VALIDATORS =====
+    
+    function isValidListing(data) {
+      // Basic schema validation for Listings
+      return data.title is string && data.title.size() > 3 && data.title.size() < 100
+        && data.price is number && data.price >= 0
+        && data.category is string
+        && (!("status" in data) || data.status in ['available', 'sold', 'pending', 'reserved']);
+    }
+
+    function isValidTrade(data) {
+      // Basic schema validation for Trades
+      // Status must be valid enum
+      // Offered coins must be positive
+      return (!("status" in data) || data.status in ['pending', 'accepted', 'declined', 'completed', 'cancelled'])
+        && (!("offeredCoins" in data) || (data.offeredCoins is number && data.offeredCoins >= 0));
+    }
+
+    // ===== USERS COLLECTION =====
+    match /users/{userId} {
+      // Anyone can read public user profiles
+      allow read: if true;
+      
+      // Only the user can write to their own profile
+      // BUT they cannot modify 'xp' or 'level' directly (unless they are admin context, but we don't have that here)
+      // Actually, for MVP client-side logic, we might need write access if we don't have cloud functions.
+      // However, per plan, we lock these down.
+      allow write: if isOwner(userId) && (
+        // Allow create (initial profile setup)
+        request.resource.data.xp == 0 || 
+        // Allow update IF xp and level are unchanged OR if we trust the client (we don't for Phase 2 strictness)
+        // STRICT MODE: User cannot change XP or Level.
+        (
+           request.resource.data.xp == resource.data.xp &&
+           request.resource.data.level == resource.data.level
+        ) ||
+        // EXCEPTION: If the doc doesn't exist yet (create), allow whatever default
+        resource == null
+      );
+    }
+
+    // ===== LISTINGS COLLECTION =====
+    match /listings/{listingId} {
+      // Anyone can read listings (marketplace is public)
+      allow read: if true;
+      
+      // Authenticated users can create listings
+      allow create: if isAuth() && 
+        request.resource.data.sellerId == request.auth.uid &&
+        isValidListing(request.resource.data);
+      
+      // Only the seller can update/delete their listings
+      allow update: if isAuth() && 
+        resource.data.sellerId == request.auth.uid &&
+        isValidListing(request.resource.data);
+        
+      allow delete: if isAuth() && 
+        resource.data.sellerId == request.auth.uid;
+    }
+
+    // ===== TRADES COLLECTION =====
+    match /trades/{tradeId} {
+      // Only participants can read trades
+      allow read: if isAuth() && (
+        resource.data.sellerId == request.auth.uid ||
+        resource.data.traderId == request.auth.uid
+      );
+      
+      // Authenticated users can create trades
+      allow create: if isAuth() && 
+        request.resource.data.traderId == request.auth.uid &&
+        isValidTrade(request.resource.data);
+      
+      // Only participants can update trade status
+      allow update: if isAuth() && (
+        resource.data.sellerId == request.auth.uid ||
+        resource.data.traderId == request.auth.uid
+      ) && isValidTrade(request.resource.data);
+      
+      // Only participants can delete (cancel) trades
+      allow delete: if isAuth() && (
+        resource.data.sellerId == request.auth.uid ||
+        resource.data.traderId == request.auth.uid
+      );
+    }
+
+    // ===== CONVERSATIONS COLLECTION =====
+    match /conversations/{conversationId} {
+      // Only participants can read conversations
+      allow read: if isAuth() && 
+        request.auth.uid in resource.data.participants;
+      
+      // Authenticated users can create conversations
+      allow create: if isAuth() && 
+        request.auth.uid in request.resource.data.participants &&
+        request.resource.data.participants.size() == 2;
+      
+      // Only participants can update (e.g., mark as read)
+      allow update: if isAuth() && 
+        request.auth.uid in resource.data.participants;
+
+      // Messages subcollection
+      match /messages/{messageId} {
+        // Only conversation participants can read messages
+        allow read: if isAuth() && 
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+        
+        // Only conversation participants can send messages
+        allow create: if isAuth() && 
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.resource.data.text is string &&
+          request.resource.data.text.size() > 0 &&
+          request.resource.data.text.size() < 2000;
+        
+        // Messages cannot be updated or deleted (immutable)
+        allow update, delete: if false;
+      }
+    }
+
+    // ===== NOTIFICATIONS COLLECTION =====
+    match /notifications/{notificationId} {
+      // Only the recipient can read their notifications
+      allow read: if isAuth() && 
+        resource.data.userId == request.auth.uid;
+      
+      // System can create notifications (via Cloud Functions)
+      // Users can create notifications for themselves
+      allow create: if isAuth() && 
+        request.resource.data.userId == request.auth.uid;
+      
+      // Only the recipient can update (e.g., mark as read)
+      allow update: if isAuth() && 
+        resource.data.userId == request.auth.uid;
+      
+      // Only the recipient can delete their notifications
+      allow delete: if isAuth() && 
+        resource.data.userId == request.auth.uid;
+    }
+
+    // ===== SCAN HISTORY COLLECTION =====
+    match /scans/{scanId} {
+      // Only the owner can read their scans
+      allow read: if isAuth() && 
+        resource.data.userId == request.auth.uid;
+      
+      // Authenticated users can create scans
+      allow create: if isAuth() && 
+        request.resource.data.userId == request.auth.uid;
+      
+      // Users can update their own scans
+      allow update: if isAuth() && 
+        resource.data.userId == request.auth.uid;
+      
+      // Users can delete their scan history
+      allow delete: if isAuth() && 
+        resource.data.userId == request.auth.uid;
+    }
+
+    // ===== REWARDS COLLECTION (Read-only) =====
+    match /rewards/{rewardId} {
+      // Anyone can read available rewards
+      allow read: if true;
+      
+      // Only admin can write (managed via console/functions)
+      allow write: if false;
+    }
+
+    // ===== USER REWARDS (Redeemed) =====
+    match /userRewards/{userId} {
+      allow read: if isOwner(userId);
+      allow write: if isOwner(userId);
+      
+      match /redeemed/{rewardId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // ===== LEADERBOARD (Public Read) =====
+    match /leaderboard/{entryId} {
+      allow read: if true;
+      allow write: if false; // Managed by Cloud Functions
+    }
+
+    // ===== COMMUNITY GOALS (Public Read) =====
+    match /communityGoals/{goalId} {
+      allow read: if true;
+      allow write: if false; // Managed by admin
+    }
+  }
+}

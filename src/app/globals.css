@@ -1,0 +1,337 @@
+@import "tailwindcss";
+@variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* Stitch Design Color Palette */
+  --color-primary: #25f478;
+  --color-primary-dark: #1acb55;
+  --color-background: #f6f8f7;
+  --color-background-light: #e0f2fe;
+  --color-background-blue: #dbeafe;
+  --color-sky: #e0f7ff;
+
+  /* Dark theme colors - Optimized Forest Green Palette */
+  /* Avoid pure black (#000) - use dark gray for reduced eye strain */
+  --color-dark: #0d1a12;
+  --color-dark-bg: #141f18;
+  --color-dark-surface: #1c2b22;
+  --color-dark-elevated: #243a2e;
+
+  /* Accent colors */
+  --color-accent-blue: #e0f2fe;
+  --color-accent-orange: #fbbf24;
+  --color-accent-pink: #fda4af;
+  --color-accent-yellow: #fef9c3;
+
+  /* Card colors for tags */
+  --color-card-green: #dcfce7;
+  --color-card-yellow: #fef9c3;
+  --color-card-pink: #fce7f3;
+  --color-card-blue: #e0f2fe;
+  --color-card-coral: #fecaca;
+
+  /* Neo-Brutalist Shadows */
+  --shadow-soft: 0 8px 30px rgb(0 0 0 / 0.06);
+  --shadow-card: 0 4px 20px rgb(0 0 0 / 0.08);
+  --shadow-button: 0 4px 12px rgb(0 0 0 / 0.15);
+  --shadow-brutal: 4px 4px 0px 0px #000;
+  --shadow-brutal-sm: 3px 3px 0px 0px #000;
+  --shadow-brutal-lg: 6px 6px 0px 0px #000;
+
+  /* Border radius */
+  --radius-sm: 0.75rem;
+  --radius-md: 1rem;
+  --radius-lg: 1.5rem;
+  --radius-xl: 2rem;
+  --radius-2xl: 2.5rem;
+  --radius-full: 9999px;
+}
+
+:root {
+  --bg-main: var(--color-background);
+  --text-main: var(--color-dark);
+  --text-secondary: #4b5563;
+  --text-muted: #9ca3af;
+  --border-main: var(--color-dark);
+}
+
+.dark {
+  --bg-main: var(--color-dark-bg);
+
+  /* Text colors - off-white for primary, muted grays for hierarchy */
+  --text-main: #E1E8E3;
+  --text-secondary: #9CA8A0;
+  --text-muted: #6B7770;
+
+  --border-main: rgba(37, 244, 120, 0.25);
+
+  /* Override theme tokens for automatic dark mode on utility classes */
+  --color-background: #141f18;
+  --color-background-light: #1c2b22;
+  --color-background-blue: #1c2b22;
+
+  /* Card accent colors — brighter, more visible */
+  --color-card-green: #1e4430;
+  --color-card-yellow: #3d3920;
+  --color-card-pink: #3d2030;
+  --color-card-blue: #1e303d;
+  --color-card-coral: #3d2424;
+
+  /* Accent colors — slightly desaturated */
+  --color-accent-blue: #1e303d;
+  --color-accent-orange: #d4a520;
+  --color-accent-pink: #db8a98;
+
+  /* Shadows — subtle green glow for depth */
+  --shadow-soft: 0 8px 30px rgb(0 0 0 / 0.5);
+  --shadow-card: 0 4px 20px rgb(0 0 0 / 0.4);
+  --shadow-brutal: 4px 4px 0px 0px rgba(37, 244, 120, 0.2);
+  --shadow-brutal-sm: 3px 3px 0px 0px rgba(37, 244, 120, 0.2);
+  --shadow-brutal-lg: 6px 6px 0px 0px rgba(37, 244, 120, 0.2);
+}
+
+
+/* Font family */
+body {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  min-height: 100dvh;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Hide scrollbar */
+::-webkit-scrollbar {
+  width: 0px;
+  background: transparent;
+}
+
+/* Selection color */
+::selection {
+  background-color: var(--color-primary);
+  color: var(--color-dark);
+}
+
+/* Gradient backgrounds */
+.gradient-hero {
+  background: linear-gradient(180deg, #e0f2fe 0%, #dbeafe 50%, #f6f8f7 100%);
+}
+
+.dark .gradient-hero {
+  background: linear-gradient(180deg, #0f2a1f 0%, #122e22 50%, #0f1f17 100%);
+}
+
+.gradient-success {
+  background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 50%, #f6f8f7 100%);
+}
+
+.dark .gradient-success {
+  background: linear-gradient(180deg, #1a3a28 0%, #153322 50%, #0f1f17 100%);
+}
+
+/* Neo-Brutalist Button styles */
+.btn-primary {
+  @apply h-14 rounded-full bg-primary text-dark font-extrabold tracking-wide uppercase border-[3px] border-dark shadow-brutal hover:-translate-y-0.5 active:translate-x-1 active:translate-y-1 active:shadow-none transition-all flex items-center justify-center gap-2;
+}
+
+.dark .btn-primary {
+  @apply bg-primary text-dark border-primary/30;
+}
+
+/* Neo border utility */
+.neo-border {
+  border: 3px solid #000000;
+}
+
+.dark .neo-border {
+  border-color: rgba(37, 244, 120, 0.3);
+}
+
+.btn-secondary {
+  @apply h-14 rounded-full border-[3px] border-dark bg-transparent text-dark font-bold tracking-wide hover:bg-gray-50 active:scale-95 transition-all;
+}
+
+.dark .btn-secondary {
+  @apply border-gray-500 text-white hover:bg-dark-surface;
+}
+
+.btn-pill {
+  @apply h-12 rounded-full px-6 font-bold flex items-center justify-center gap-2 transition-all;
+}
+
+.btn-pill-primary {
+  @apply h-12 rounded-full px-6 font-bold flex items-center justify-center gap-2 transition-all bg-primary text-dark border-2 border-transparent;
+}
+
+.btn-pill-secondary {
+  @apply h-12 rounded-full px-6 font-bold flex items-center justify-center gap-2 transition-all bg-gray-100 text-gray-600 border border-transparent;
+}
+
+.dark .btn-pill-secondary {
+  @apply bg-dark-surface text-gray-300;
+}
+
+/* Card styles */
+.card {
+  @apply bg-white rounded-[2rem] border-[3px] border-dark p-6 shadow-sm;
+}
+
+.dark .card {
+  @apply bg-dark-surface border-gray-600;
+}
+
+.card-soft {
+  @apply bg-white rounded-2xl border border-gray-100 p-4 shadow-sm;
+}
+
+.dark .card-soft {
+  @apply bg-dark-surface border-gray-700;
+}
+
+/* Circular image container */
+.circle-image {
+  @apply rounded-full border-[3px] border-white shadow-soft overflow-hidden bg-gray-200;
+}
+
+.dark .circle-image {
+  @apply border-gray-600 bg-gray-700;
+}
+
+/* Badge styles */
+.badge-impact {
+  @apply bg-primary text-dark px-4 py-2 rounded-full border-2 border-white shadow-lg flex items-center gap-2 font-extrabold text-sm tracking-wide;
+}
+
+.dark .badge-impact {
+  @apply border-dark-surface;
+}
+
+.badge-coins {
+  @apply bg-primary text-dark px-4 py-2 rounded-full flex items-center gap-2 font-bold;
+}
+
+.badge-tag {
+  @apply px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider;
+}
+
+/* Icon button */
+.icon-btn {
+  @apply w-12 h-12 rounded-full bg-white border border-gray-100 shadow-sm flex items-center justify-center hover:scale-105 transition-transform;
+}
+
+.dark .icon-btn {
+  @apply bg-dark-surface border-gray-600;
+}
+
+/* Input styles */
+.input-search {
+  @apply w-full h-14 rounded-full bg-gray-100 border border-gray-200 px-6 font-medium placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent;
+}
+
+.dark .input-search {
+  @apply bg-dark-surface border-gray-600 text-white placeholder:text-gray-500;
+}
+
+/* Tab styles */
+.tab-pill {
+  @apply px-4 py-2 rounded-full font-bold text-sm transition-all;
+}
+
+.tab-pill-active {
+  @apply px-4 py-2 rounded-full font-bold text-sm transition-all bg-dark text-white;
+}
+
+.dark .tab-pill-active {
+  @apply bg-primary text-dark;
+}
+
+.tab-pill-inactive {
+  @apply px-4 py-2 rounded-full font-bold text-sm transition-all bg-white text-dark border border-gray-200 hover:bg-gray-50;
+}
+
+.dark .tab-pill-inactive {
+  @apply bg-dark-surface text-white/70 border-gray-600 hover:bg-dark-bg;
+}
+
+/* Animation utilities */
+.hover-lift {
+  @apply hover:-translate-y-1 hover:shadow-lg transition-all;
+}
+
+.hover-scale {
+  @apply hover:scale-105 transition-transform;
+}
+
+/* Sticky bottom bar */
+.sticky-bottom {
+  @apply fixed bottom-0 left-0 w-full p-4 bg-white/80 backdrop-blur-xl border-t border-gray-200 z-50;
+}
+
+.dark .sticky-bottom {
+  @apply bg-dark-bg/80 border-gray-700;
+}
+
+/* Section label */
+.section-label {
+  @apply text-gray-400 text-xs font-bold uppercase tracking-wider;
+}
+
+.dark .section-label {
+  color: var(--text-muted);
+}
+
+/* Semantic text color utilities */
+.text-primary-adaptive {
+  color: var(--text-main);
+}
+
+.text-secondary-adaptive {
+  color: var(--text-secondary);
+}
+
+.text-muted-adaptive {
+  color: var(--text-muted);
+}
+
+/* Material symbols filled */
+.material-symbols-filled {
+  font-variation-settings: 'FILL' 1;
+}
+
+/* Add subtle animation for loading */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-shimmer {
+  animation: shimmer 2s linear infinite;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+.dark .skeleton {
+  background: linear-gradient(90deg, #1a2e23 25%, #243a2e 50%, #1a2e23 75%);
+  background-size: 200% 100%;
+}
+
+/* No scrollbar utility */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
