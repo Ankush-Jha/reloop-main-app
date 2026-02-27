@@ -31,14 +31,10 @@
 **ReLoop** is a hyper-local, gamified marketplace designed to solve the massive waste problem on university campuses. It empowers students to recirculate items instead of throwing them away, using **AI recognition**, **virtual currency (ReCoins)**, and **competitive gamification** to make sustainability effortless and addictive.
 
 <p align="center">
-  <img src="public/screenshots/home.png" width="200" alt="Home Dashboard" />
-  <img src="public/screenshots/marketplace.png" width="200" alt="Marketplace" />
-  <img src="public/screenshots/scanner.png" width="200" alt="AI Scanner" />
-</p>
-<p align="center">
-  <img src="public/screenshots/profile.png" width="200" alt="Profile - Year in Green" />
-  <img src="public/screenshots/leaderboard.png" width="200" alt="Campus Ranking" />
-  <img src="public/screenshots/onboarding.png" width="200" alt="Onboarding" />
+  <img src="public/screenshots/home.jpg" width="200" alt="Home Dashboard" />
+  <img src="public/screenshots/marketplace.jpg" width="200" alt="Market Hub" />
+  <img src="public/screenshots/diy-hub.jpg" width="200" alt="DIY Hub" />
+  <img src="public/screenshots/smart-bags.jpg" width="200" alt="Smart Bags" />
 </p>
 
 ### The Problem
