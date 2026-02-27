@@ -30,7 +30,16 @@
 
 **ReLoop** is a hyper-local, gamified marketplace designed to solve the massive waste problem on university campuses. It empowers students to recirculate items instead of throwing them away, using **AI recognition**, **virtual currency (ReCoins)**, and **competitive gamification** to make sustainability effortless and addictive.
 
-![App Screenshot Placeholder](https://via.placeholder.com/800x400.png?text=ReLoop+App+Screenshots+Collage)
+<p align="center">
+  <img src="public/screenshots/home.png" width="200" alt="Home Dashboard" />
+  <img src="public/screenshots/marketplace.png" width="200" alt="Marketplace" />
+  <img src="public/screenshots/scanner.png" width="200" alt="AI Scanner" />
+</p>
+<p align="center">
+  <img src="public/screenshots/profile.png" width="200" alt="Profile - Year in Green" />
+  <img src="public/screenshots/leaderboard.png" width="200" alt="Campus Ranking" />
+  <img src="public/screenshots/onboarding.png" width="200" alt="Onboarding" />
+</p>
 
 ### The Problem
 Every year, students discard tons of usable furniture, textbooks, and electronics during move-out. Existing solutions are either too broad (Facebook Marketplace) or inconvenient (Recycling centers).
