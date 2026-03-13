@@ -12,18 +12,31 @@ interface ListingCardProps {
 }
 
 export function ListingCard({ listing, isOwner, onEdit, onDelete }: ListingCardProps) {
+    const CATEGORY_PLACEHOLDERS: Record<string, string> = {
+        electronics: 'https://images.unsplash.com/photo-1498049794561-7780e7231661?w=400',
+        furniture: 'https://images.unsplash.com/photo-1555041469-a586c61ea9bc?w=400',
+        clothing: 'https://images.unsplash.com/photo-1445205170230-053b83016050?w=400',
+        books: 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=400',
+        sports: 'https://images.unsplash.com/photo-1461896836934-ffe607ba8211?w=400',
+        other: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=400',
+    };
+    const imageUrl = (listing.images && listing.images.length > 0)
+        ? listing.images[0]
+        : (CATEGORY_PLACEHOLDERS[listing.category?.toLowerCase()] ?? CATEGORY_PLACEHOLDERS.other);
+
     return (
         <Link href={`/marketplace/${listing.id}`} className="block h-full">
             <div className="bg-[#FAFAFA] rounded-2xl border-4 border-black shadow-[4px_4px_0px_0px_#000] overflow-hidden flex flex-col group active:translate-x-[2px] active:translate-y-[2px] active:shadow-none transition-all h-full">
                 {/* Image Container */}
                 <div className="aspect-square bg-white border-b-4 border-black relative flex items-center justify-center overflow-hidden">
                     <img
-                        src={listing.images[0]}
+                        src={imageUrl}
                         alt={listing.title}
                         className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
                     />
                     {/* Green Eco Dot */}
                     <div className="absolute top-3 right-3 w-4 h-4 bg-primary rounded-full border-2 border-black z-10 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]"></div>
+
 
                     {/* Owner Actions Overlay */}
                     {isOwner && (

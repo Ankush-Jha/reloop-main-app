@@ -258,7 +258,7 @@ export default function MarketplacePage() {
                         Fresh Picks
                     </h2>
                     <Link href="/my-listings" className="text-xs font-bold underline uppercase">
-                        View All
+                        My Listings
                     </Link>
                 </div>
                 {isLoading ? (

@@ -13,6 +13,7 @@ import {
     setDoc,
     onSnapshot,
     limit,
+    increment,
     Unsubscribe,
     runTransaction
 } from "firebase/firestore";
@@ -170,8 +171,11 @@ export const DBService = {
         try {
             // Generate ID client-side to save a write operation
             const newRef = doc(collection(db, "listings"));
+            // Callers can override `status`; default is 'available'
+            const { status = 'available', ...rest } = listingData as any;
             await setDoc(newRef, {
-                ...listingData,
+                ...rest,
+                status,
                 id: newRef.id,
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp()
@@ -182,6 +186,7 @@ export const DBService = {
             throw error;
         }
     },
+
 
     async getListings(): Promise<Listing[]> {
         try {
@@ -358,6 +363,34 @@ export const DBService = {
                 lastMessage: lastMessageText,
                 lastMessageAt: serverTimestamp()
             });
+
+            // Notify the OTHER participant(s) for real messages (not system messages)
+            if (messageType !== 'system' && senderId !== 'system') {
+                try {
+                    const convSnap = await getDoc(convRef);
+                    const convData = convSnap.data();
+                    const participants: string[] = convData?.participants || [];
+                    const recipients = participants.filter(p => p !== senderId);
+                    for (const recipientId of recipients) {
+                        const notifRef = doc(collection(db, "notifications"));
+                        await setDoc(notifRef, {
+                            userId: recipientId,
+                            type: 'message',
+                            title: messageType === 'offer' ? 'New Offer! 💰' : 'New Message 💬',
+                            message: messageType === 'offer'
+                                ? `Someone offered ${offerAmount} coins for your item.`
+                                : text.length > 80 ? text.substring(0, 80) + '…' : text,
+                            icon: messageType === 'offer' ? 'local_offer' : 'chat',
+                            conversationId,
+                            read: false,
+                            createdAt: serverTimestamp()
+                        });
+                    }
+                } catch (notifErr) {
+                    // Non-fatal — message already sent successfully
+                    console.error('Failed to create message notification:', notifErr);
+                }
+            }
 
             return docRef.id;
         } catch (error) {
@@ -598,6 +631,27 @@ export const DBService = {
                 updatedAt: serverTimestamp(),
                 status: 'pending'
             });
+
+            // Notify the seller that they have a new trade offer
+            if (tradeData.sellerId) {
+                try {
+                    const notifRef = doc(collection(db, "notifications"));
+                    await setDoc(notifRef, {
+                        userId: tradeData.sellerId,
+                        type: 'trade',
+                        title: 'New Trade Offer! 🤝',
+                        message: `Someone wants to trade for "${(tradeData as any).listingTitle || 'your item'}".`,
+                        icon: 'swap_horiz',
+                        tradeId: newRef.id,
+                        read: false,
+                        createdAt: serverTimestamp()
+                    });
+                } catch (notifErr) {
+                    // Non-fatal — trade already created
+                    console.error('Failed to create trade notification:', notifErr);
+                }
+            }
+
             return newRef.id;
         } catch (error) {
             console.error("Error creating trade:", error);
@@ -647,11 +701,73 @@ export const DBService = {
     ) {
         try {
             const tradeRef = doc(db, "trades", tradeId);
+            const tradeSnap = await getDoc(tradeRef);
+            const tradeData = tradeSnap.data();
+
             await updateDoc(tradeRef, {
                 status,
+                updatedAt: serverTimestamp(),
                 ...(status === 'completed' ? { completedAt: serverTimestamp() } : {}),
                 ...additionalData
             });
+
+            // On completion: mark listing as sold and increment co2Saved for seller
+            if (status === 'completed' && tradeData) {
+                const co2PerTrade = 2.5; // kg CO2 saved per successful trade
+
+                // Mark the listing as sold
+                if (tradeData.listingId) {
+                    try {
+                        await updateDoc(doc(db, "listings", tradeData.listingId), {
+                            status: 'sold',
+                            soldAt: serverTimestamp()
+                        });
+                    } catch (e) {
+                        console.error('Failed to mark listing as sold:', e);
+                    }
+                }
+
+                // Increment co2Saved for both seller and buyer
+                const usersToUpdate = [
+                    tradeData.sellerId,
+                    tradeData.traderId
+                ].filter(Boolean);
+
+                for (const uid of usersToUpdate) {
+                    try {
+                        await updateDoc(doc(db, "users", uid), {
+                            co2Saved: increment(co2PerTrade),
+                            itemsTraded: increment(1)
+                        });
+                    } catch (e) {
+                        console.error('Failed to increment co2Saved for', uid, e);
+                    }
+                }
+
+                // Notify both parties the trade is complete
+                const parties = [
+                    { uid: tradeData.sellerId, role: 'seller' },
+                    { uid: tradeData.traderId, role: 'buyer' }
+                ].filter(p => p.uid);
+
+                for (const party of parties) {
+                    try {
+                        const notifRef = doc(collection(db, "notifications"));
+                        await setDoc(notifRef, {
+                            userId: party.uid,
+                            type: 'trade',
+                            title: 'Trade Complete! 🎉',
+                            message: `Your trade for "${tradeData.listingTitle || 'an item'}" is done. You earned +${co2PerTrade}kg CO₂ saved!`,
+                            icon: 'check_circle',
+                            tradeId,
+                            read: false,
+                            createdAt: serverTimestamp()
+                        });
+                    } catch (e) {
+                        console.error('Failed to create completion notification:', e);
+                    }
+                }
+            }
         } catch (error) {
             console.error("Error updating trade status:", error);
             throw error;
@@ -807,7 +923,8 @@ export const DBService = {
     // REWARDS
     async getRewards(): Promise<any[]> {
         try {
-            const q = query(collection(db, "rewards"), where("available", "==", true));
+            // Field name aligned with firestore.indexes.json: `isActive`
+            const q = query(collection(db, "rewards"), where("isActive", "==", true));
             const snapshot = await getDocs(q);
             return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         } catch (error) {
@@ -1034,7 +1151,8 @@ export const DBService = {
     // RELOOP POINTS & RECYCLE ZONES
     async getReloopPoints(): Promise<any[]> {
         try {
-            const q = query(collection(db, "reloopPoints"), where("active", "==", true));
+            // Field name aligned with firestore.indexes.json: `isActive`
+            const q = query(collection(db, "reloopPoints"), where("isActive", "==", true));
             const snapshot = await getDocs(q);
             if (snapshot.empty) return [];
             return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -1046,7 +1164,8 @@ export const DBService = {
 
     async getRecycleZones(): Promise<any[]> {
         try {
-            const q = query(collection(db, "recycleZones"), where("active", "==", true));
+            // Field name aligned with firestore.indexes.json: `isActive`
+            const q = query(collection(db, "recycleZones"), where("isActive", "==", true));
             const snapshot = await getDocs(q);
             if (snapshot.empty) return [];
             return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -1095,16 +1214,20 @@ export const DBService = {
         try {
             const coinsAwarded = 5;
             const xpEarned = 10;
+            const co2PerRecycle = 0.5; // kg CO2 saved per recycled item
 
             await runTransaction(db, async (transaction) => {
-                // Add coins to user
+                // Add coins, XP, and co2Saved to user
                 const userRef = doc(db, "users", userId);
                 const userDoc = await transaction.get(userRef);
                 const currentCoins = userDoc.data()?.coins || 0;
                 const currentXp = userDoc.data()?.xp || 0;
+                const currentCo2 = userDoc.data()?.co2Saved || 0;
                 transaction.update(userRef, {
                     coins: currentCoins + coinsAwarded,
-                    xp: currentXp + xpEarned
+                    xp: currentXp + xpEarned,
+                    co2Saved: currentCo2 + co2PerRecycle,
+                    itemsRecycled: (userDoc.data()?.itemsRecycled || 0) + 1
                 });
 
                 // Create recycling record
@@ -1115,6 +1238,7 @@ export const DBService = {
                     zoneId,
                     coinsAwarded,
                     xpEarned,
+                    co2Saved: co2PerRecycle,
                     createdAt: serverTimestamp()
                 });
 
@@ -1124,7 +1248,7 @@ export const DBService = {
                     userId,
                     type: 'coin',
                     title: 'Recycling Complete! ♻️',
-                    message: `You earned ${coinsAwarded} coins and ${xpEarned} XP for recycling.`,
+                    message: `You earned ${coinsAwarded} coins and saved ${co2PerRecycle}kg CO₂ for recycling.`,
                     icon: 'recycling',
                     read: false,
                     createdAt: serverTimestamp()
@@ -1137,6 +1261,7 @@ export const DBService = {
             return { success: false, coinsAwarded: 0, xpEarned: 0 };
         }
     },
+
 
     // ===== LEADERBOARD =====
     async getLeaderboard(limitCount: number = 50): Promise<any[]> {
