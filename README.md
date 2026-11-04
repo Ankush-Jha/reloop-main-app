@@ -162,3 +162,13 @@ Contributions are what make the open source community such an amazing place to l
 5.  Open a Pull Request
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+---
+
+## 🔐 Roles, rules & tests
+
+- **Worker / admin accounts:** set `role: "worker"` (or `"admin"`) on `users/<uid>` in the Firebase console. Users can never change their own role (enforced by `firestore.rules`). The separate `reloop-worker-app` signs in with these accounts.
+- **Deploy rules:** `firebase deploy --only firestore:rules` (the app's writes depend on them).
+- **Trade payments:** coins move only when the seller (or zone staff) verifies the buyer's pickup QR; the rules re-check the whole settlement.
+- **Tests (need Java + firebase-tools):** `npm run test:rules` (main app flows) and `npm run test:worker` (needs `../reloop-worker-app`), both run against the Firestore/Auth emulators with the real rules.
+- **Trust model:** self-granted XP/coins (scans, missions, recycling) are only bounded per write, not verified. Move them to Cloud Functions before coins are redeemable for real money.

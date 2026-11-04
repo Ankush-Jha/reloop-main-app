@@ -1,0 +1,10 @@
+{
+  "name": "ReLoop",
+  "short_name": "ReLoop",
+  "description": "Scan, trade, and upcycle items on campus. Earn coins and save the planet!",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#4ce68a",
+  "icons": []
+}

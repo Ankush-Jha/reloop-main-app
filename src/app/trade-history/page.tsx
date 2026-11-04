@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import DemoManager from '@/lib/demo-manager';
 import { DBService } from '@/lib/firebase/db';
+import { PickupQR } from '@/components/chat/PickupQR';
 import { useAuth } from '@/lib/contexts/AuthContext';
 import { Trade } from '@/types';
 import { PageHeader } from '@/components/ui/PageHeader';
@@ -89,22 +90,13 @@ export default function TradeHistoryPage() {
 
         setProcessingTradeId(trade.id);
         try {
-            // Update trade status
-            await DBService.updateTradeStatus(trade.id, 'accepted');
-
-            // If there are coins to transfer, do it
-            if (trade.offeredCoins && trade.offeredCoins > 0) {
-                await DBService.transferCoins(trade.traderId, user.uid, trade.offeredCoins);
-            }
-
-            // Reload trades
+            // Reserves the item. Coins only move later, when the pickup QR is verified.
+            await DBService.acceptTrade({ tradeId: trade.id, sellerId: user.uid });
             await loadTrades();
-
-            // Navigate to verify trade page
-            router.push('/verify-trade');
-        } catch (error) {
+        } catch (error: any) {
             console.error('Error accepting trade:', error);
-            alert('Failed to accept trade. Please try again.');
+            alert(error?.message || 'Failed to accept trade. Please try again.');
+            await loadTrades();
         } finally {
             setProcessingTradeId(null);
         }
@@ -119,11 +111,11 @@ export default function TradeHistoryPage() {
 
         setProcessingTradeId(trade.id);
         try {
-            await DBService.updateTradeStatus(trade.id, 'declined');
+            await DBService.declineTrade({ tradeId: trade.id, sellerId: user.uid });
             await loadTrades();
-        } catch (error) {
+        } catch (error: any) {
             console.error('Error declining trade:', error);
-            alert('Failed to decline trade. Please try again.');
+            alert(error?.message || 'Failed to decline trade. Please try again.');
         } finally {
             setProcessingTradeId(null);
         }
@@ -301,13 +293,19 @@ export default function TradeHistoryPage() {
                                                 </div>
                                             )}
 
-                                            {/* Verify Trade button for accepted trades */}
-                                            {trade.status === 'accepted' && (
+                                            {/* Accepted deal: buyer shows a QR, seller scans it */}
+                                            {trade.status === 'accepted' && user?.uid === trade.traderId && (
+                                                <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-col items-center">
+                                                    <p className="text-xs font-bold text-dark/60 dark:text-white/60 mb-3">Show this QR to the seller at pickup</p>
+                                                    <PickupQR tradeId={trade.id} buyerId={trade.traderId} />
+                                                </div>
+                                            )}
+                                            {trade.status === 'accepted' && user?.uid === trade.sellerId && (
                                                 <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-700">
-                                                    <Link href="/verify-trade">
+                                                    <Link href={`/verify-trade?trade=${trade.id}`}>
                                                         <button className="w-full py-3 rounded-xl bg-card-blue border-2 border-dark text-dark font-bold text-sm shadow-brutal-sm hover:shadow-none active:translate-y-0.5 transition-all flex items-center justify-center gap-2">
-                                                            <span className="material-symbols-outlined text-lg">verified</span>
-                                                            Verify Trade
+                                                            <span className="material-symbols-outlined text-lg">qr_code_scanner</span>
+                                                            Scan Buyer&apos;s QR
                                                         </button>
                                                     </Link>
                                                 </div>

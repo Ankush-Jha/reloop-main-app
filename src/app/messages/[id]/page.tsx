@@ -28,7 +28,7 @@ export default function ChatPage() {
     const params = useParams();
     const router = useRouter();
     const conversationId = params.id as string;
-    const { user } = useAuth();
+    const { user, isDemo } = useAuth();
     const [messages, setChatMessages] = useState<ChatMessage[]>([]);
     const [contact, setContact] = useState<Message | null>(null);
     const [newMessage, setNewMessage] = useState('');
@@ -42,7 +42,7 @@ export default function ChatPage() {
         let unsubscribe: (() => void) | null = null;
 
         const setupRealtime = async () => {
-            if (user?.uid) {
+            if (user?.uid && !isDemo) {
                 try {
                     // Get conversation info
                     const conversations = await DBService.getConversations(user.uid);
@@ -84,6 +84,7 @@ export default function ChatPage() {
                             offerAmount: m.offerAmount,
                             offerStatus: m.offerStatus,
                             counterAmount: m.counterAmount,
+                            tradeId: m.tradeId,
                             qrType: m.qrType,
                             qrData: m.qrData,
                         }));
@@ -118,7 +119,7 @@ export default function ChatPage() {
                 unsubscribe();
             }
         };
-    }, [conversationId, user]);
+    }, [conversationId, user, isDemo]);
 
     // Auto-scroll to bottom
     useEffect(() => {
@@ -170,7 +171,7 @@ export default function ChatPage() {
         setNewMessage('');
 
         // Send via Firebase if authenticated
-        if (user?.uid) {
+        if (user?.uid && !isDemo) {
             try {
                 await DBService.sendMessage(conversationId, user.uid, msg.text);
             } catch (error) {
@@ -305,42 +306,38 @@ export default function ChatPage() {
                                     amount={msg.offerAmount}
                                     status={msg.offerStatus || 'pending'}
                                     counterAmount={msg.counterAmount}
-                                    isSeller={!msg.isOwn} // If not my message, I'm the seller receiving the offer
+                                    isSeller={!msg.isOwn}
                                     isOwn={msg.isOwn}
                                     onAccept={async () => {
-                                        if (user?.uid && msg.offerAmount && contact) {
-                                            try {
-                                                // Update offer status with all required data for QR generation
-                                                await DBService.updateOfferStatus(
-                                                    conversationId,
-                                                    msg.id,
-                                                    'accepted',
-                                                    undefined, // counterAmount
-                                                    msg.offerAmount,
-                                                    contact.listingId,
-                                                    contact.listingTitle,
-                                                    user.uid, // seller (current user accepting)
-                                                    msg.senderId // buyer (person who sent offer)
-                                                );
-
-                                                // Mark the listing as pending (will be sold after QR pickup scan)
-                                                if (contact.listingId) {
-                                                    await DBService.updateListingStatus(contact.listingId, 'pending');
-                                                    alert(`🎉 Deal confirmed! Pickup QR sent to buyer. Item will be removed from marketplace after pickup is complete.`);
-                                                }
-                                            } catch (error) {
-                                                console.error('Error accepting offer:', error);
-                                                alert('Failed to accept offer. Please try again.');
-                                            }
+                                        if (!user?.uid) return;
+                                        if (!msg.tradeId) {
+                                            alert('This is an old offer without a deal attached. Ask the buyer to send a new offer.');
+                                            return;
+                                        }
+                                        try {
+                                            await DBService.acceptTrade({
+                                                tradeId: msg.tradeId,
+                                                sellerId: user.uid,
+                                                conversationId,
+                                                messageId: msg.id,
+                                            });
+                                        } catch (error: any) {
+                                            console.error('Error accepting offer:', error);
+                                            alert(error?.message || 'Failed to accept offer. Please try again.');
                                         }
                                     }}
                                     onDecline={async () => {
-                                        if (user?.uid) {
-                                            try {
-                                                await DBService.updateOfferStatus(conversationId, msg.id, 'declined');
-                                            } catch (error) {
-                                                console.error('Error declining offer:', error);
-                                            }
+                                        if (!user?.uid || !msg.tradeId) return;
+                                        try {
+                                            await DBService.declineTrade({
+                                                tradeId: msg.tradeId,
+                                                sellerId: user.uid,
+                                                conversationId,
+                                                messageId: msg.id,
+                                            });
+                                        } catch (error: any) {
+                                            console.error('Error declining offer:', error);
+                                            alert(error?.message || 'Failed to decline offer.');
                                         }
                                     }}
                                     timestamp={msg.timestamp}
@@ -352,6 +349,7 @@ export default function ChatPage() {
                                     qrData={msg.qrData}
                                     isOwn={msg.isOwn}
                                     timestamp={msg.timestamp}
+                                    currentUserId={user?.uid}
                                 />
                             ) : msg.type === 'system' ? (
                                 /* System message (offer accepted/declined) */
@@ -397,17 +395,18 @@ export default function ChatPage() {
                             setShowOfferUI(false);
 
                             // If logged in, use Firebase
-                            if (user?.uid) {
+                            if (user?.uid && !isDemo) {
                                 try {
-                                    await DBService.sendOffer(
-                                        conversationId,
-                                        user.uid,
-                                        amount,
-                                        contact.listingTitle
-                                    );
-                                } catch (error) {
+                                    const listing = contact.listingId ? await DBService.getListingById(contact.listingId) : null;
+                                    if (!listing) throw new Error('This listing is no longer available');
+                                    await DBService.makeOffer({
+                                        listing,
+                                        buyer: { uid: user.uid, name: user.name, avatar: user.avatar },
+                                        coins: amount,
+                                    });
+                                } catch (error: any) {
                                     console.error('Error sending offer:', error);
-                                    alert('Failed to send offer. Please try again.');
+                                    alert(error?.message || 'Failed to send offer. Please try again.');
                                 }
                             } else {
                                 // Demo mode - add as regular message

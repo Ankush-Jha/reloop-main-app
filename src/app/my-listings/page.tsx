@@ -14,7 +14,11 @@ import { CreateListingWizard } from '@/components/ui/CreateListingWizard';
 const STATUS_CONFIG = {
     available: { label: 'Active', color: 'bg-primary text-dark', icon: '🟢' },
     pending: { label: 'Pending', color: 'bg-yellow-400 text-dark', icon: '🟡' },
-    sold: { label: 'Sold', color: 'bg-gray-400 text-white', icon: '🔴' }
+    sold: { label: 'Sold', color: 'bg-gray-400 text-white', icon: '🔴' },
+    reserved: { label: 'Reserved', color: 'bg-yellow-400 text-dark', icon: '🟡' },
+    at_point: { label: 'At Point', color: 'bg-blue-300 text-dark', icon: '📍' },
+    donated: { label: 'Donated', color: 'bg-gray-400 text-white', icon: '💚' },
+    recycled: { label: 'Recycled', color: 'bg-gray-400 text-white', icon: '♻️' }
 };
 
 export default function MyListingsPage() {
@@ -73,18 +77,14 @@ export default function MyListingsPage() {
         if (!user?.uid) return;
         setProcessingTradeId(trade.id);
         try {
-            await DBService.updateTradeStatus(trade.id, 'accepted');
-            // Transfer coins if offered
-            if (trade.offeredCoins && trade.offeredCoins > 0) {
-                await DBService.transferCoins(trade.traderId, user.uid, trade.offeredCoins);
-            }
-            // Reload data
+            // Reserves the item; coins only move when the buyer's pickup QR is verified.
+            await DBService.acceptTrade({ tradeId: trade.id, sellerId: user.uid });
             await loadListings();
-            // Navigate to verify trade
-            router.push('/verify-trade');
-        } catch (error) {
+            router.push(`/verify-trade?trade=${trade.id}`);
+        } catch (error: any) {
             console.error('Error accepting trade:', error);
-            alert('Failed to accept trade. Please try again.');
+            alert(error?.message || 'Failed to accept trade. Please try again.');
+            await loadListings();
         } finally {
             setProcessingTradeId(null);
         }
@@ -95,11 +95,11 @@ export default function MyListingsPage() {
         if (!user?.uid) return;
         setProcessingTradeId(trade.id);
         try {
-            await DBService.updateTradeStatus(trade.id, 'declined');
+            await DBService.declineTrade({ tradeId: trade.id, sellerId: user.uid });
             await loadListings();
-        } catch (error) {
+        } catch (error: any) {
             console.error('Error declining trade:', error);
-            alert('Failed to decline trade. Please try again.');
+            alert(error?.message || 'Failed to decline trade. Please try again.');
         } finally {
             setProcessingTradeId(null);
         }
@@ -216,6 +216,7 @@ export default function MyListingsPage() {
                                                     src={listing.images[0]}
                                                     alt={listing.title}
                                                     fill
+                                                    unoptimized
                                                     className="object-cover"
                                                 />
                                             ) : (

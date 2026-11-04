@@ -14,7 +14,7 @@ interface TradeOfferModalProps {
 }
 
 export const TradeOfferModal = ({ targetListing, onClose, onSuccess }: TradeOfferModalProps) => {
-    const { user } = useAuth();
+    const { user, isDemo } = useAuth();
     // Mock user inventory (listings created by current user)
     // In a real app, this would be fetched from API
     const [myInventory, setMyInventory] = useState<Listing[]>([]);
@@ -25,17 +25,26 @@ export const TradeOfferModal = ({ targetListing, onClose, onSuccess }: TradeOffe
     const [completedMission, setCompletedMission] = useState<Mission | null>(null);
 
     useEffect(() => {
+        let cancelled = false;
         const loadInventory = async () => {
-            await new Promise(resolve => setTimeout(resolve, 500));
-            // Get listings that are NOT the target listing and presumably belong to "me" (mock logic)
-            // For demo, we'll just get some other listings
-            const allListings = DemoManager.getMockListings();
-            const others = allListings.filter(l => l.id !== targetListing.id).slice(0, 4);
-            setMyInventory(others);
-            setIsLoading(false);
+            try {
+                if (isDemo) {
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    const others = DemoManager.getMockListings().filter(l => l.id !== targetListing.id).slice(0, 4);
+                    if (!cancelled) setMyInventory(others);
+                } else if (user?.uid) {
+                    // Real users can only offer items they actually own and still have available.
+                    const { DBService } = await import('@/lib/firebase/db');
+                    const mine = await DBService.getUserListings(user.uid);
+                    if (!cancelled) setMyInventory(mine.filter(l => l.status === 'available' && l.id !== targetListing.id).slice(0, 6));
+                }
+            } finally {
+                if (!cancelled) setIsLoading(false);
+            }
         };
         loadInventory();
-    }, [targetListing.id]);
+        return () => { cancelled = true; };
+    }, [targetListing.id, isDemo, user?.uid]);
 
     const handleSubmit = async () => {
         if (!selectedItemId && !offeredCoins) return;
@@ -54,77 +63,18 @@ export const TradeOfferModal = ({ targetListing, onClose, onSuccess }: TradeOffe
         setIsSubmitting(true);
 
         try {
-            // Import DBService to create real trade
             const { DBService } = await import('@/lib/firebase/db');
 
-            // Get the selected item details if any
             const selectedItem = selectedItemId ? myInventory.find(i => i.id === selectedItemId) : null;
-
-            // Create trade data with proper validation
-            // Note: Don't include undefined values - Firestore rejects them
             const offeredCoinsNum = parseInt(offeredCoins) || 0;
-            const tradeData = {
-                listingId: targetListing.id,
-                listingTitle: targetListing.title || 'Untitled',
-                listingImage: targetListing.images?.[0] || '',
-                sellerId: targetListing.seller.id,
-                sellerName: targetListing.seller.name || 'Seller',
-                sellerAvatar: targetListing.seller.avatar || '',
-                traderId: user.uid,
-                traderName: user.name || 'User',
-                traderAvatar: user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || 'User')}&background=4ce68a&color=fff`,
-                status: 'pending' as const,
-                // Only include optional fields if they have values
-                ...(selectedItem?.title ? { offeredItem: selectedItem.title } : {}),
-                ...(offeredCoinsNum > 0 ? { offeredCoins: offeredCoinsNum } : {}),
-            };
 
-            console.log('Creating trade with data:', tradeData);
-
-            // Save trade to Firestore
-            const tradeId = await DBService.createTrade(tradeData);
-            console.log('Trade created successfully:', tradeId);
-
-            // Create a conversation with the seller and send trade offer as offer card
-            try {
-                // Find or create conversation with listing context
-                const conversationId = await DBService.findOrCreateConversation(
-                    user.uid,
-                    targetListing.seller.id,
-                    targetListing.id,
-                    targetListing.title,
-                    targetListing.images?.[0],
-                    targetListing.price,
-                    targetListing.seller.name,
-                    targetListing.seller.avatar
-                );
-
-                // Send the trade offer as an offer-type message (shows as OfferCard)
-                await DBService.sendOffer(
-                    conversationId,
-                    user.uid,
-                    offeredCoinsNum,
-                    targetListing.title
-                );
-                console.log('Conversation created with offer card:', conversationId);
-            } catch (convError) {
-                console.warn('Failed to create conversation:', convError);
-                // Don't fail the whole trade if conversation creation fails
-            }
-
-            // Create notification for the seller (don't fail if this fails)
-            try {
-                await DBService.createNotification({
-                    userId: targetListing.seller.id,
-                    type: 'trade',
-                    title: 'New Trade Offer!',
-                    message: `${tradeData.traderName} wants to trade for your "${targetListing.title}"`,
-                    icon: 'swap_horiz',
-                    actionUrl: '/messages',
-                });
-            } catch (notifError) {
-                console.warn('Failed to create notification:', notifError);
-            }
+            // Creates the trade, opens the chat and posts the offer card (all validated server-side too).
+            await DBService.makeOffer({
+                listing: targetListing,
+                buyer: { uid: user.uid, name: user.name, avatar: user.avatar },
+                coins: offeredCoinsNum,
+                offeredItem: selectedItem?.title,
+            });
 
             // Check for mission completion
             try {

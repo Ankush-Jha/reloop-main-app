@@ -6,6 +6,8 @@ import { useNavStore } from '@/lib/store/nav-store';
 import { useEffect, useState, useRef } from 'react';
 import { motion, AnimatePresence, PanInfo } from 'framer-motion';
 import DemoManager from '@/lib/demo-manager';
+import { useAuth } from '@/lib/contexts/AuthContext';
+import { DBService } from '@/lib/firebase/db';
 import { CreateListingWizard } from './CreateListingWizard';
 
 // Navigation items - symmetric 2-1-2 layout around center FAB
@@ -34,17 +36,20 @@ export function BottomNav() {
     const [isListingWizardOpen, setIsListingWizardOpen] = useState(false);
     const navRef = useRef<HTMLElement>(null);
 
-    // Track unread messages for badge
+    const { user, isDemo } = useAuth();
+
+    // Track unread messages for badge (demo data is only for demo users)
     useEffect(() => {
-        const updateUnread = () => {
-            const messages = DemoManager.getMockMessages();
-            const count = messages.filter(m => m.unread).length;
-            setUnreadCount(count);
-        };
-        updateUnread();
-        const unsubscribe = DemoManager.subscribe(updateUnread);
-        return unsubscribe;
-    }, []);
+        if (isDemo) {
+            const updateUnread = () => setUnreadCount(DemoManager.getMockMessages().filter(m => m.unread).length);
+            updateUnread();
+            return DemoManager.subscribe(updateUnread);
+        }
+        if (!user?.uid) { setUnreadCount(0); return; }
+        return DBService.subscribeToNotifications(user.uid, (list) => {
+            setUnreadCount(list.filter(n => !n.read && n.type === 'message').length);
+        });
+    }, [isDemo, user?.uid]);
 
     // Hide nav on auth pages, scanner, and item detail pages (they have custom nav)
     const hiddenRoutes = ['/login', '/register', '/onboarding', '/scanner'];

@@ -1,217 +1,459 @@
 rules_version = '2';
+
+// ReLoop Firestore rules.
+//
+// TRUST MODEL (read this before changing anything):
+//  * There are no Cloud Functions, so the client performs every write.
+//  * Value that moves BETWEEN users (trade payments, bag-collection payouts) is
+//    locked down: the rules re-check the whole settlement with getAfter(), so a
+//    user can never edit another user's coins outside a valid, atomic settlement.
+//  * Value a user grants THEMSELVES (scan XP, mission XP, recycle coins ...) can't
+//    be verified without a server. Those writes are only bounded (per-write caps,
+//    monotonic xp/level). Do NOT convert coins to real money until those paths
+//    move to Cloud Functions.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ===== HELPER FUNCTIONS =====
-    
-    // Check if user is authenticated
+    // ===== HELPERS =====
     function isAuth() {
       return request.auth != null;
     }
-    
-    // Check if user is the owner
+
     function isOwner(userId) {
       return isAuth() && request.auth.uid == userId;
     }
-    
-    // Check if user is a participant in a trade/conversation
-    function isParticipant(data) {
-      return isAuth() && (
-        request.auth.uid == data.sellerId ||
-        request.auth.uid == data.buyerId ||
-        request.auth.uid == data.traderId ||
-        request.auth.uid in data.participants
-      );
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
     }
 
-    // ===== VALIDATORS =====
-    
+    // role is set manually (console / admin SDK). Users can never change it themselves.
+    function roleOf(uid) {
+      return exists(userPath(uid)) ? get(userPath(uid)).data.get('role', 'student') : 'student';
+    }
+
+    function isStaff() {
+      return isAuth() && roleOf(request.auth.uid) in ['worker', 'admin'];
+    }
+
+    function isAdmin() {
+      return isAuth() && roleOf(request.auth.uid) == 'admin';
+    }
+
+    // ===== USERS =====
+    // Per-write bounds for values a user grants themselves (see trust model above).
+    function selfUpdateOk() {
+      let d = request.resource.data;
+      let b = resource.data;
+      return d.get('uid', b.get('uid', '')) == b.get('uid', '')
+        && d.get('role', 'student') == b.get('role', 'student')
+        && d.get('coins', 0) >= 0
+        && d.get('coins', 0) - b.get('coins', 0) <= 500
+        && d.get('xp', 0) >= b.get('xp', 0)
+        && d.get('xp', 0) - b.get('xp', 0) <= 500
+        && d.get('level', 1) >= b.get('level', 1)
+        && d.get('level', 1) <= (d.get('xp', 0) / 100) + 1
+        && d.get('co2Saved', 0) >= b.get('co2Saved', 0)
+        && d.get('co2Saved', 0) - b.get('co2Saved', 0) <= 50
+        // itemsTraded only changes through a settlement
+        && d.get('itemsTraded', 0) == b.get('itemsTraded', 0);
+    }
+
+    // A seller completing a trade may update BOTH users' balances in the same
+    // atomic write, but only exactly by the agreed amount of that trade.
+    function tradeSettlementOk(uid) {
+      let d = request.resource.data;
+      let b = resource.data;
+      let tid = d.get('lastTradeId', '');
+      let tradePath = /databases/$(database)/documents/trades/$(tid);
+      return tid != ''
+        && tid != b.get('lastTradeId', '')
+        && d.diff(b).affectedKeys().hasOnly(['coins', 'itemsTraded', 'co2Saved', 'lastTradeId', 'updatedAt'])
+        && d.get('itemsTraded', 0) - b.get('itemsTraded', 0) == 1
+        && d.get('co2Saved', 0) - b.get('co2Saved', 0) <= 5
+        && get(tradePath).data.status == 'accepted'
+        && getAfter(tradePath).data.status == 'completed'
+        && (getAfter(tradePath).data.sellerId == request.auth.uid || isStaff())
+        && (
+          (uid == get(tradePath).data.traderId
+            && d.get('coins', 0) == b.get('coins', 0) - get(tradePath).data.agreedCoins)
+          || (uid == get(tradePath).data.sellerId
+            && d.get('coins', 0) == b.get('coins', 0) + get(tradePath).data.agreedCoins)
+        );
+    }
+
+    // A worker/admin collecting a smart bag credits the bag owner exactly the
+    // payout recorded on the bag, in the same atomic write.
+    function bagPayoutOk(uid) {
+      let d = request.resource.data;
+      let b = resource.data;
+      let bid = d.get('lastBagId', '');
+      let bagPath = /databases/$(database)/documents/smartBags/$(bid);
+      return isStaff()
+        && bid != ''
+        && bid != b.get('lastBagId', '')
+        && request.auth.uid != uid
+        && d.diff(b).affectedKeys().hasOnly(['coins', 'xp', 'level', 'co2Saved', 'bagsRecycled', 'lastBagId', 'updatedAt'])
+        && d.get('xp', 0) >= b.get('xp', 0)
+        && d.get('xp', 0) - b.get('xp', 0) <= 1300
+        && d.get('level', 1) >= b.get('level', 1)
+        && d.get('level', 1) <= (d.get('xp', 0) / 100) + 1
+        && get(bagPath).data.status == 'filled'
+        && getAfter(bagPath).data.status == 'processed'
+        && getAfter(bagPath).data.ownerId == uid
+        && d.get('coins', 0) == b.get('coins', 0) + getAfter(bagPath).data.coinsAwarded
+        && d.get('co2Saved', 0) - b.get('co2Saved', 0) <= 130;
+    }
+
+    match /users/{userId} {
+      // Signed-in users only (profiles contain emails).
+      allow read: if isAuth();
+
+      // Sign-up: welcome bonus only, never a role.
+      allow create: if isOwner(userId)
+        && request.resource.data.get('uid', userId) == userId
+        && request.resource.data.get('coins', 0) <= 100
+        && request.resource.data.get('xp', 0) == 0
+        && request.resource.data.get('level', 1) == 1
+        && request.resource.data.get('role', 'student') == 'student';
+
+      allow update: if isAuth() && (
+        (isOwner(userId) && selfUpdateOk())
+        || tradeSettlementOk(userId)
+        || bagPayoutOk(userId)
+      );
+
+      allow delete: if false;
+    }
+
+    // ===== LISTINGS =====
     function isValidListing(data) {
-      // Basic schema validation for Listings
-      return data.title is string && data.title.size() > 3 && data.title.size() < 100
+      return data.title is string && data.title.size() >= 2 && data.title.size() <= 100
         && data.price is number && data.price >= 0
         && data.category is string
-        && (!("status" in data) || data.status in ['available', 'sold', 'pending', 'reserved']);
+        && data.seller is map && data.seller.id is string
+        && (!("images" in data) || (data.images is list && data.images.size() <= 5))
+        && (!("status" in data) || data.status in
+            ['available', 'sold', 'pending', 'reserved', 'at_point', 'donated', 'recycled']);
     }
 
-    function isValidTrade(data) {
-      // Basic schema validation for Trades
-      // Status must be valid enum
-      // Offered coins must be positive
-      return (!("status" in data) || data.status in ['pending', 'accepted', 'declined', 'completed', 'cancelled'])
-        && (!("offeredCoins" in data) || (data.offeredCoins is number && data.offeredCoins >= 0));
-    }
-
-    // ===== USERS COLLECTION =====
-    match /users/{userId} {
-      // Anyone can read public user profiles
-      allow read: if true;
-      
-      // Only the user can write to their own profile
-      // BUT they cannot modify 'xp' or 'level' directly (unless they are admin context, but we don't have that here)
-      // Actually, for MVP client-side logic, we might need write access if we don't have cloud functions.
-      // However, per plan, we lock these down.
-      allow write: if isOwner(userId) && (
-        // Allow create (initial profile setup)
-        request.resource.data.xp == 0 || 
-        // Allow update IF xp and level are unchanged OR if we trust the client (we don't for Phase 2 strictness)
-        // STRICT MODE: User cannot change XP or Level.
-        (
-           request.resource.data.xp == resource.data.xp &&
-           request.resource.data.level == resource.data.level
-        ) ||
-        // EXCEPTION: If the doc doesn't exist yet (create), allow whatever default
-        resource == null
-      );
-    }
-
-    // ===== LISTINGS COLLECTION =====
     match /listings/{listingId} {
-      // Anyone can read listings (marketplace is public)
       allow read: if true;
-      
-      // Authenticated users can create listings
-      allow create: if isAuth() && 
-        request.resource.data.sellerId == request.auth.uid &&
-        isValidListing(request.resource.data);
-      
-      // Only the seller can update/delete their listings
-      allow update: if isAuth() && 
-        resource.data.sellerId == request.auth.uid &&
-        isValidListing(request.resource.data);
-        
-      allow delete: if isAuth() && 
-        resource.data.sellerId == request.auth.uid;
+
+      allow create: if isAuth()
+        && request.resource.data.seller.id == request.auth.uid
+        && isValidListing(request.resource.data);
+
+      // Only the seller edits a listing and the seller can't be swapped out.
+      allow update: if isAuth()
+        && request.resource.data.seller.id == resource.data.seller.id
+        && isValidListing(request.resource.data)
+        && (
+          resource.data.seller.id == request.auth.uid
+          // Zone staff completing a pickup may only flip the listing to sold.
+          || (isStaff()
+              && request.resource.data.status == 'sold'
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'soldAt', 'updatedAt']))
+        );
+
+      allow delete: if isAuth() && resource.data.seller.id == request.auth.uid;
     }
 
-    // ===== TRADES COLLECTION =====
+    // ===== TRADES =====
+    function listingPath(listingId) {
+      return /databases/$(database)/documents/listings/$(listingId);
+    }
+
     match /trades/{tradeId} {
-      // Only participants can read trades
-      allow read: if isAuth() && (
-        resource.data.sellerId == request.auth.uid ||
-        resource.data.traderId == request.auth.uid
-      );
-      
-      // Authenticated users can create trades
-      allow create: if isAuth() && 
-        request.resource.data.traderId == request.auth.uid &&
-        isValidTrade(request.resource.data);
-      
-      // Only participants can update trade status
-      allow update: if isAuth() && (
-        resource.data.sellerId == request.auth.uid ||
-        resource.data.traderId == request.auth.uid
-      ) && isValidTrade(request.resource.data);
-      
-      // Only participants can delete (cancel) trades
-      allow delete: if isAuth() && (
-        resource.data.sellerId == request.auth.uid ||
-        resource.data.traderId == request.auth.uid
-      );
-    }
+      function tradeCoreUnchanged() {
+        let d = request.resource.data;
+        let b = resource.data;
+        return d.sellerId == b.sellerId
+          && d.traderId == b.traderId
+          && d.listingId == b.listingId
+          && d.get('offeredCoins', 0) == b.get('offeredCoins', 0)
+          && d.get('offeredItem', '') == b.get('offeredItem', '');
+      }
 
-    // ===== CONVERSATIONS COLLECTION =====
-    match /conversations/{conversationId} {
-      // Only participants can read conversations
-      allow read: if isAuth() && 
-        request.auth.uid in resource.data.participants;
-      
-      // Authenticated users can create conversations
-      allow create: if isAuth() && 
-        request.auth.uid in request.resource.data.participants &&
-        request.resource.data.participants.size() == 2;
-      
-      // Only participants can update (e.g., mark as read)
-      allow update: if isAuth() && 
-        request.auth.uid in resource.data.participants;
+      // The seller supplies the code from the buyer's QR; it must equal the secret
+      // only the buyer can read. Buyer's balance must be debited, seller's credited,
+      // in the very same write.
+      function completionOk() {
+        let d = request.resource.data;
+        let b = resource.data;
+        let secretPath = /databases/$(database)/documents/trades/$(tradeId)/secrets/pickup;
+        let amount = b.get('agreedCoins', 0);
+        return d.get('agreedCoins', 0) == amount
+          && exists(secretPath)
+          && d.get('verifiedCode', '') == get(secretPath).data.code
+          && getAfter(userPath(b.traderId)).data.get('coins', 0) == get(userPath(b.traderId)).data.get('coins', 0) - amount
+          && get(userPath(b.traderId)).data.get('coins', 0) >= amount
+          && getAfter(userPath(b.sellerId)).data.get('coins', 0) == get(userPath(b.sellerId)).data.get('coins', 0) + amount
+          && getAfter(userPath(b.traderId)).data.get('lastTradeId', '') == tradeId
+          && getAfter(userPath(b.sellerId)).data.get('lastTradeId', '') == tradeId
+          && getAfter(listingPath(b.listingId)).data.status == 'sold';
+      }
 
-      // Messages subcollection
-      match /messages/{messageId} {
-        // Only conversation participants can read messages
-        allow read: if isAuth() && 
-          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
-        
-        // Only conversation participants can send messages
-        allow create: if isAuth() && 
-          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants &&
-          request.resource.data.senderId == request.auth.uid &&
-          request.resource.data.text is string &&
-          request.resource.data.text.size() > 0 &&
-          request.resource.data.text.size() < 2000;
-        
-        // Messages cannot be updated or deleted (immutable)
+      allow read: if isAuth()
+        && (resource.data.sellerId == request.auth.uid || resource.data.traderId == request.auth.uid || isStaff());
+
+      // Anyone can offer on a real, available listing that isn't theirs.
+      allow create: if isAuth()
+        && request.resource.data.traderId == request.auth.uid
+        && request.resource.data.sellerId != request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.get('offeredCoins', 0) is number
+        && request.resource.data.get('offeredCoins', 0) >= 0
+        && request.resource.data.get('offeredCoins', 0) <= 1000000
+        && !('agreedCoins' in request.resource.data)
+        && exists(listingPath(request.resource.data.listingId))
+        && get(listingPath(request.resource.data.listingId)).data.seller.id == request.resource.data.sellerId
+        && get(listingPath(request.resource.data.listingId)).data.status == 'available';
+
+      allow update: if isAuth() && tradeCoreUnchanged() && (
+        // Seller accepts: reserves the listing in the same write.
+        (request.auth.uid == resource.data.sellerId
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'accepted'
+          && request.resource.data.agreedCoins == resource.data.get('offeredCoins', 0)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'agreedCoins', 'acceptedAt', 'updatedAt'])
+          && get(listingPath(resource.data.listingId)).data.status == 'available'
+          && getAfter(listingPath(resource.data.listingId)).data.status == 'pending')
+        // Seller declines.
+        || (request.auth.uid == resource.data.sellerId
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'declined'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
+        // Buyer withdraws a pending offer.
+        || (request.auth.uid == resource.data.traderId
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
+        // Seller cancels an accepted deal and re-opens the listing.
+        || (request.auth.uid == resource.data.sellerId
+          && resource.data.status == 'accepted'
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && getAfter(listingPath(resource.data.listingId)).data.status == 'available')
+        // Seller (or zone staff) completes after scanning the buyer's pickup QR.
+        || ((request.auth.uid == resource.data.sellerId || isStaff())
+          && resource.data.status == 'accepted'
+          && request.resource.data.status == 'completed'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'verifiedCode', 'completedAt', 'updatedAt'])
+          && completionOk())
+      );
+
+      allow delete: if false;
+
+      // Pickup secret: written once by the buyer, readable only by the buyer.
+      match /secrets/{secretId} {
+        allow read: if isAuth()
+          && get(/databases/$(database)/documents/trades/$(tradeId)).data.traderId == request.auth.uid;
+        allow create: if isAuth()
+          && secretId == 'pickup'
+          && get(/databases/$(database)/documents/trades/$(tradeId)).data.traderId == request.auth.uid
+          && get(/databases/$(database)/documents/trades/$(tradeId)).data.status == 'accepted'
+          && request.resource.data.code is string
+          && request.resource.data.code.matches('^[A-Z0-9]{8}$');
         allow update, delete: if false;
       }
     }
 
-    // ===== NOTIFICATIONS COLLECTION =====
+    // ===== CONVERSATIONS =====
+    match /conversations/{conversationId} {
+      allow read: if isAuth() && request.auth.uid in resource.data.participants;
+
+      allow create: if isAuth()
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() == 2;
+
+      // Participants can't be changed after creation.
+      allow update: if isAuth()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.participants == resource.data.participants;
+
+      match /messages/{messageId} {
+        function convParticipants() {
+          return get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+        }
+
+        allow read: if isAuth() && request.auth.uid in convParticipants();
+
+        // senderId is always the real author (system/QR messages are authored by
+        // whoever triggered them and rendered by `type`).
+        allow create: if isAuth()
+          && request.auth.uid in convParticipants()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() < 2000
+          && request.resource.data.get('type', 'text') in ['text', 'offer', 'system', 'qr']
+          && (request.resource.data.get('type', 'text') != 'offer'
+              || (request.resource.data.offerAmount is number && request.resource.data.offerAmount >= 0));
+
+        // Only the OTHER participant may respond to an offer.
+        allow update: if isAuth()
+          && request.auth.uid in convParticipants()
+          && resource.data.get('type', 'text') == 'offer'
+          && resource.data.senderId != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['offerStatus', 'counterAmount']);
+
+        allow delete: if false;
+      }
+    }
+
+    // ===== NOTIFICATIONS =====
     match /notifications/{notificationId} {
-      // Only the recipient can read their notifications
-      allow read: if isAuth() && 
-        resource.data.userId == request.auth.uid;
-      
-      // System can create notifications (via Cloud Functions)
-      // Users can create notifications for themselves
-      allow create: if isAuth() && 
-        request.resource.data.userId == request.auth.uid;
-      
-      // Only the recipient can update (e.g., mark as read)
-      allow update: if isAuth() && 
-        resource.data.userId == request.auth.uid;
-      
-      // Only the recipient can delete their notifications
-      allow delete: if isAuth() && 
-        resource.data.userId == request.auth.uid;
+      allow read, delete: if isAuth() && resource.data.userId == request.auth.uid;
+
+      // Own notifications, or a notification FOR someone else that is signed with
+      // the author's uid (so it can't be forged as another user).
+      allow create: if isAuth()
+        && request.resource.data.read == false
+        && (request.resource.data.userId == request.auth.uid
+            || request.resource.data.get('fromUserId', '') == request.auth.uid);
+
+      allow update: if isAuth()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
     }
 
-    // ===== SCAN HISTORY COLLECTION =====
+    // ===== SCANS =====
     match /scans/{scanId} {
-      // Only the owner can read their scans
-      allow read: if isAuth() && 
-        resource.data.userId == request.auth.uid;
-      
-      // Authenticated users can create scans
-      allow create: if isAuth() && 
-        request.resource.data.userId == request.auth.uid;
-      
-      // Users can update their own scans
-      allow update: if isAuth() && 
-        resource.data.userId == request.auth.uid;
-      
-      // Users can delete their scan history
-      allow delete: if isAuth() && 
-        resource.data.userId == request.auth.uid;
+      allow read: if isAuth() && resource.data.userId == request.auth.uid;
+      allow create: if isAuth()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.get('claimed', false) == false;
+      // Once claimed it is frozen (no re-claiming).
+      allow update: if isAuth()
+        && resource.data.userId == request.auth.uid
+        && resource.data.get('claimed', false) == false
+        && request.resource.data.userId == resource.data.userId;
+      allow delete: if isAuth() && resource.data.userId == request.auth.uid;
     }
 
-    // ===== REWARDS COLLECTION (Read-only) =====
+    // ===== SMART BAGS =====
+    match /smartBags/{bagId} {
+      allow read: if isAuth() && (resource.data.ownerId == request.auth.uid || isStaff());
+
+      // Document id IS the QR code => a QR can only ever be registered once.
+      allow create: if isAuth()
+        && bagId.matches('^[A-Z0-9][A-Z0-9_-]{3,39}$')
+        && request.resource.data.qrCode == bagId
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status == 'registered';
+
+      allow update: if isAuth() && (
+        // Owner marks their registered bag as filled.
+        (resource.data.ownerId == request.auth.uid
+          && resource.data.status == 'registered'
+          && request.resource.data.status == 'filled'
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'filledAt', 'wasteType']))
+        // Staff collect a filled bag: weight (0, 50] kg, payout capped at the top material rate (25 coins/kg).
+        || (isStaff()
+          && resource.data.status == 'filled'
+          && request.resource.data.status == 'processed'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'collectedAt', 'processedAt', 'collectedBy', 'processedBy', 'estimatedWeight', 'actualWeight', 'materials', 'coinsAwarded', 'xpAwarded'])
+          && request.resource.data.collectedBy == request.auth.uid
+          && request.resource.data.actualWeight is number
+          && request.resource.data.actualWeight > 0
+          && request.resource.data.actualWeight <= 50
+          && request.resource.data.coinsAwarded is int
+          && request.resource.data.coinsAwarded >= 0
+          && request.resource.data.coinsAwarded <= math.ceil(request.resource.data.actualWeight * 25)
+          && getAfter(userPath(resource.data.ownerId)).data.get('coins', 0)
+              == get(userPath(resource.data.ownerId)).data.get('coins', 0) + request.resource.data.coinsAwarded)
+      );
+
+      allow delete: if false;
+    }
+
+    // ===== COIN LEDGER / REDEMPTIONS / DONATIONS / RECYCLING =====
+    match /coinTransactions/{id} {
+      allow read: if isAuth() && resource.data.userId == request.auth.uid;
+      allow create: if isAuth() && request.resource.data.get('byUid', '') == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /redemptions/{id} {
+      allow read: if isAuth() && (resource.data.userId == request.auth.uid || isStaff());
+      // The cost must match the reward and the user's balance must drop by it.
+      allow create: if isAuth()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && exists(/databases/$(database)/documents/rewards/$(request.resource.data.rewardId))
+        && get(/databases/$(database)/documents/rewards/$(request.resource.data.rewardId)).data.cost == request.resource.data.cost
+        && getAfter(userPath(request.auth.uid)).data.get('coins', 0)
+            == get(userPath(request.auth.uid)).data.get('coins', 0) - request.resource.data.cost;
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    match /donations/{id} {
+      allow read: if isAuth() && resource.data.userId == request.auth.uid;
+      allow create: if isAuth()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && getAfter(userPath(request.auth.uid)).data.get('coins', 0)
+            == get(userPath(request.auth.uid)).data.get('coins', 0) - request.resource.data.amount;
+      allow update, delete: if false;
+    }
+
+    match /recyclingRecords/{id} {
+      allow read: if isAuth() && resource.data.userId == request.auth.uid;
+      allow create: if isAuth() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Doc ids are "<uid>_<yyyy-mm-dd>", so ownership can be checked from the id (works for reads of missing docs too).
+    match /userDailyMissions/{id} {
+      allow read, create, update: if isAuth() && id.matches(request.auth.uid + '_[0-9-]+');
+      allow delete: if false;
+    }
+
+    // ===== PUBLIC / ADMIN-MANAGED =====
     match /rewards/{rewardId} {
-      // Anyone can read available rewards
       allow read: if true;
-      
-      // Only admin can write (managed via console/functions)
-      allow write: if false;
+      allow write: if isAdmin();
     }
 
-    // ===== USER REWARDS (Redeemed) =====
+    match /reloopPoints/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /recycleZones/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /config/{id} {
+      allow read: if isAuth();
+      allow write: if isAdmin();
+    }
+
     match /userRewards/{userId} {
-      allow read: if isOwner(userId);
-      allow write: if isOwner(userId);
-      
+      allow read, write: if isOwner(userId);
       match /redeemed/{rewardId} {
         allow read, write: if isOwner(userId);
       }
     }
 
-    // ===== LEADERBOARD (Public Read) =====
-    match /leaderboard/{entryId} {
-      allow read: if true;
-      allow write: if false; // Managed by Cloud Functions
+    match /transactions/{id} {
+      allow read: if isAuth() && request.auth.uid in resource.data.participants;
+      allow write: if false;
     }
 
-    // ===== COMMUNITY GOALS (Public Read) =====
+    match /leaderboard/{entryId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
     match /communityGoals/{goalId} {
       allow read: if true;
-      allow write: if false; // Managed by admin
+      allow write: if false;
     }
   }
 }

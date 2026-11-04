@@ -21,6 +21,9 @@ export interface User {
     fcmTokens?: string[]; // Push notification tokens
     tradesCompleted?: number; // Number of completed trades
     donationsMade?: number; // Number of donations made
+    role?: 'student' | 'worker' | 'admin'; // Set manually in the Firebase console, never by the client
+    lastTradeId?: string;
+    lastBagId?: string;
     createdAt?: Date;
     updatedAt?: Date;
 }
@@ -131,7 +134,7 @@ export interface Listing {
         itemsTraded?: number;
         responseTime?: string;
     };
-    status: 'available' | 'sold' | 'pending';
+    status: 'available' | 'sold' | 'pending' | 'reserved' | 'at_point' | 'donated' | 'recycled';
     createdAt: Date;
     // 14-Day Liquidity Protocol
     droppedAt?: Date;
@@ -199,6 +202,7 @@ export interface ChatMessage {
     offerAmount?: number;
     offerStatus?: 'pending' | 'accepted' | 'declined' | 'countered';
     counterAmount?: number;
+    tradeId?: string;
     // For QR code messages
     qrType?: 'dropoff' | 'pickup';
     qrData?: {
@@ -237,7 +241,9 @@ export interface Trade {
     traderAvatar: string;
     offeredItem?: string;
     offeredCoins?: number;
-    status: 'pending' | 'accepted' | 'completed' | 'declined';
+    /** Coins that move when the deal completes (fixed when the seller accepts). */
+    agreedCoins?: number;
+    status: 'pending' | 'accepted' | 'completed' | 'declined' | 'cancelled';
     createdAt: Date;
     completedAt?: Date;
     co2Saved?: number;

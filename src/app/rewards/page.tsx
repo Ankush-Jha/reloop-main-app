@@ -373,11 +373,12 @@ export default function RewardsPage() {
         try {
             if (!isDemo) {
                 // Firebase redemption
-                const result = await DBService.redeemReward(authUser.uid, reward.id, reward.cost);
+                const result = await DBService.redeemReward(authUser.uid, reward.id);
                 if (result.success) {
                     setRedeemed(prev => new Set([...prev, reward.id]));
                     if (reward.category !== 'donation') {
-                        setRedemptionCode(generateRedemptionCode());
+                        // Show the code that was actually saved with the redemption.
+                        setRedemptionCode(result.code || generateRedemptionCode());
                     }
                     setSelectedReward(reward);
                 } else {

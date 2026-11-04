@@ -57,13 +57,13 @@ export default function SmartBagDetailPage() {
                 const updated = allBags.find((b: SmartBag) => b.id === bagId);
                 setBag(updated || null);
             } else {
-                await DBService.updateSmartBagStatus(bagId, 'filled', {
-                    wasteType: 'recyclable'
-                });
+                if (!user?.uid) throw new Error('Not signed in');
+                await DBService.markBagFilled(bagId, user.uid);
                 // Bag will be updated via subscription
             }
-        } catch (err) {
+        } catch (err: any) {
             console.error('Error marking bag as filled:', err);
+            alert(err?.message || 'Could not mark the bag as filled.');
         } finally {
             setMarking(false);
         }

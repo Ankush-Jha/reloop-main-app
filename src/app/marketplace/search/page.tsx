@@ -4,6 +4,8 @@ import { useState, useEffect, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
+import { useAuth } from '@/lib/contexts/AuthContext';
+import { DBService } from '@/lib/firebase/db';
 import DemoManager from '@/lib/demo-manager';
 import { Listing } from '@/types';
 import { PageHeader } from '@/components/ui/PageHeader';
@@ -26,8 +28,16 @@ function SearchContent() {
     const [results, setResults] = useState<Listing[]>([]);
     const [sortBy, setSortBy] = useState<'relevance' | 'price-low' | 'price-high'>('relevance');
 
+    const { isDemo, isLoading: authLoading } = useAuth();
+    const [allListings, setAllListings] = useState<Listing[]>([]);
+
     useEffect(() => {
-        const allListings = DemoManager.getMockListings();
+        if (authLoading) return;
+        if (isDemo) { setAllListings(DemoManager.getMockListings()); return; }
+        DBService.getListings().then(setAllListings).catch(() => setAllListings([]));
+    }, [isDemo, authLoading]);
+
+    useEffect(() => {
         const q = query.toLowerCase();
 
         let filtered = q.length >= 2

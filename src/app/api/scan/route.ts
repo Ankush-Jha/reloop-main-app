@@ -8,14 +8,25 @@ const MODEL_ID = '@cf/meta/llama-3.2-11b-vision-instruct';
 
 export async function POST(request: Request) {
     try {
-        const body = await request.json();
-        const { image } = body;
-
-        if (!image) {
+        if (!ACCOUNT_ID || !API_TOKEN) {
             return NextResponse.json(
-                { success: false, error: 'No image data provided' },
+                { success: false, error: 'AI scanning is not configured on the server' },
+                { status: 503 }
+            );
+        }
+
+        const body = await request.json().catch(() => null);
+        const image = body?.image;
+
+        if (typeof image !== 'string' || !/^data:image\/(jpeg|jpg|png|webp);base64,/.test(image)) {
+            return NextResponse.json(
+                { success: false, error: 'A JPEG, PNG or WebP image is required' },
                 { status: 400 }
             );
+        }
+        // ~3 MB of base64: the client downsizes to 800px first, anything bigger is abuse.
+        if (image.length > 4_000_000) {
+            return NextResponse.json({ success: false, error: 'Image is too large' }, { status: 413 });
         }
 
         console.log("☁️ Calling Cloudflare AI...");
@@ -58,8 +69,11 @@ export async function POST(request: Request) {
 
         if (!cfResponse.ok) {
             const errorText = await cfResponse.text();
-            console.error('Cloudflare API Error:', errorText);
-            throw new Error(`Cloudflare Error (${cfResponse.status}): ${errorText}`);
+            console.error('Cloudflare API Error:', cfResponse.status, errorText);
+            return NextResponse.json(
+                { success: false, error: 'The AI service is unavailable right now' },
+                { status: 502 }
+            );
         }
 
         const aiResult = await cfResponse.json();
@@ -71,7 +85,7 @@ export async function POST(request: Request) {
         // Cloudflare returns { result: { response: "..." } } or { result: { description: "..." } }
         const rawText = aiResult.result?.response || aiResult.result?.description;
 
-        let parsedItem = {
+        let parsedItem: Record<string, any> = {
             objectName: 'Unknown Item',
             category: 'Other',
             material: 'Mixed',
@@ -110,30 +124,41 @@ export async function POST(request: Request) {
                 parsedItem.objectName = String(rawText);
             }
 
-            // Normalize Category
-            if (parsedItem.category) {
-                parsedItem.category = parsedItem.category.charAt(0).toUpperCase() + parsedItem.category.slice(1);
-            }
         } else {
             console.warn("⚠️ No response/description found in result");
         }
+
+        // Never trust model output: coerce every field to a safe type/range.
+        const CATEGORIES = ['electronics', 'books', 'furniture', 'clothing', 'kitchen', 'sports', 'other'];
+        const str = (v: unknown, fallback: string, max = 80) =>
+            typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : fallback;
+        const rawCategory = str(parsedItem.category, 'other', 30).toLowerCase();
+        const category = CATEGORIES.includes(rawCategory) ? rawCategory : 'other';
+        const coinsRaw = Number(parsedItem.estimatedCoins);
+        const estimatedCoins = Number.isFinite(coinsRaw) ? Math.min(200, Math.max(10, Math.round(coinsRaw))) : 50;
+        const ideas = Array.isArray(parsedItem.upcycleIdeas) ? parsedItem.upcycleIdeas.slice(0, 5) : [];
 
         return NextResponse.json({
             success: true,
             classification: 'safe',
             xpEarned: 15,
             item: {
-                ...parsedItem,
-                confidence: 0.95,
+                objectName: str(parsedItem.objectName, 'Unknown Item'),
+                category: category.charAt(0).toUpperCase() + category.slice(1),
+                material: str(parsedItem.material, 'Mixed'),
+                condition: ['Like New', 'Good', 'Fair', 'Poor'].includes(parsedItem.condition as string) ? parsedItem.condition : 'Good',
+                estimatedCoins,
+                recyclable: parsedItem.recyclable !== false,
+                upcycleIdeas: ideas,
                 recycleInfo: 'Check local campus recycling guidelines',
-                co2Savings: Math.round(parsedItem.estimatedCoins * 0.1)
+                co2Savings: Math.round(estimatedCoins * 0.1)
             }
         });
 
     } catch (error: any) {
         console.error('Scan API Error:', error);
         return NextResponse.json(
-            { success: false, error: error.message || 'Internal server error' },
+            { success: false, error: 'Internal server error' },
             { status: 500 }
         );
     }

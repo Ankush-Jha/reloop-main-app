@@ -125,6 +125,7 @@ export default function HomePage() {
                 src={user.avatar || 'https://ui-avatars.com/api/?name=User'}
                 alt="Profile"
                 fill
+                unoptimized
                 className="object-cover"
               />
             </div>

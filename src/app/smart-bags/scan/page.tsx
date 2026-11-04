@@ -1,12 +1,13 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { useRouter } from 'next/navigation';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { useAuth } from '@/lib/contexts/AuthContext';
 import { DBService } from '@/lib/firebase/db';
-import { Html5Qrcode } from 'html5-qrcode';
+import { QrScanner } from '@/components/scanner/QrScanner';
+import { normalizeBagCode } from '@/lib/qr';
 
 export default function ScanBagPage() {
     const router = useRouter();
@@ -17,95 +18,38 @@ export default function ScanBagPage() {
     const [error, setError] = useState('');
     const [manualInput, setManualInput] = useState('');
     const [cameraError, setCameraError] = useState('');
-    const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
-    const scannerInitialized = useRef(false);
 
-    useEffect(() => {
-        // Cleanup on unmount
-        return () => {
-            if (html5QrCodeRef.current && scannerInitialized.current) {
-                html5QrCodeRef.current.stop().catch(err => console.error('Error stopping scanner:', err));
-            }
-        };
-    }, []);
-
-    // Initialize camera scanner when scanning state becomes true (after qr-reader div is in DOM)
-    useEffect(() => {
-        if (!scanning || isDemo || scannedQR) return;
-
-        const initScanner = async () => {
-            // Wait a small moment for DOM to be ready
-            await new Promise(resolve => setTimeout(resolve, 100));
-
-            const qrReaderEl = document.getElementById('qr-reader');
-            if (!qrReaderEl) {
-                console.error('qr-reader element not found');
-                setCameraError('Scanner element not found. Please try again.');
-                setScanning(false);
-                return;
-            }
-
-            try {
-                const html5QrCode = new Html5Qrcode('qr-reader');
-                html5QrCodeRef.current = html5QrCode;
-
-                const config = {
-                    fps: 10,
-                    qrbox: { width: 250, height: 250 },
-                    aspectRatio: 1.0
-                };
-
-                await html5QrCode.start(
-                    { facingMode: 'environment' }, // Use back camera
-                    config,
-                    (decodedText) => {
-                        // Success callback
-                        setScannedQR(decodedText.toUpperCase());
-                        html5QrCode.stop().then(() => {
-                            scannerInitialized.current = false;
-                            setScanning(false);
-                        }).catch(err => console.error('Error stopping:', err));
-                    },
-                    () => {
-                        // Scanning error callback (not critical, happens every frame without QR)
-                    }
-                );
-
-                scannerInitialized.current = true;
-
-            } catch (err: any) {
-                console.error('Camera error:', err);
-                setCameraError(err.message || 'Failed to access camera. Please allow camera permissions or use manual input.');
-                setScanning(false);
-            }
-        };
-
-        initScanner();
-    }, [scanning, isDemo, scannedQR]);
+    // A code was read (camera or typed). Anything that isn't a bag code is rejected,
+    // instead of being "registered" as a bag.
+    const acceptCode = (raw: string) => {
+        setScanning(false);
+        const code = normalizeBagCode(raw);
+        if (!code) {
+            setCameraError("That QR code isn't a ReLoop bag code. Try the QR printed on your smart bag.");
+            return;
+        }
+        setCameraError('');
+        setScannedQR(code);
+    };
 
     const handleScan = async () => {
         setError('');
         setCameraError('');
 
         if (isDemo) {
-            // Demo mode - generate a random QR code
+            // Demo mode has no real bags to scan: pick one from the demo pool.
             setScanning(true);
-            await new Promise(resolve => setTimeout(resolve, 1500));
+            await new Promise(resolve => setTimeout(resolve, 1200));
             const DemoManager = require('@/lib/demo-manager').default;
-            const qr = DemoManager.getUnregisteredBagQR();
-            setScannedQR(qr);
             setScanning(false);
+            acceptCode(DemoManager.getUnregisteredBagQR());
             return;
         }
-
-        // Set scanning to true - useEffect will initialize the camera after the qr-reader div renders
         setScanning(true);
     };
 
     const handleManualSubmit = () => {
-        if (manualInput.trim()) {
-            setScannedQR(manualInput.trim().toUpperCase());
-        }
+        if (manualInput.trim()) acceptCode(manualInput);
     };
 
     const handleRegister = async () => {
@@ -247,11 +191,14 @@ export default function ScanBagPage() {
                 >
                     {scanning ? (
                         // Real QR Scanner
-                        <div
-                            id="qr-reader"
-                            className="w-full h-full"
-                            style={{ border: 'none' }}
-                        ></div>
+                        isDemo ? (
+                            <div className="absolute inset-0 flex items-center justify-center text-white/70 font-bold">Simulating scan…</div>
+                        ) : (
+                            <QrScanner
+                                onScan={acceptCode}
+                                onError={(msg) => { setScanning(false); setCameraError(msg); }}
+                            />
+                        )
                     ) : (
                         // Placeholder when not scanning
                         <div className="absolute inset-0 bg-gradient-to-br from-gray-800 to-gray-900 flex items-center justify-center">
@@ -285,8 +232,8 @@ export default function ScanBagPage() {
                 </div>
 
                 <button
-                    onClick={handleScan}
-                    disabled={scanning}
+                    onClick={() => (scanning && !isDemo ? setScanning(false) : handleScan())}
+                    disabled={scanning && isDemo}
                     className="w-20 h-20 bg-green-500 rounded-full border-4 border-dark shadow-brutal flex items-center justify-center active:scale-95 transition-transform disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                     {scanning ? (

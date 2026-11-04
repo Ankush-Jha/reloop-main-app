@@ -2,6 +2,7 @@
 
 import { QRCodeSVG } from 'qrcode.react';
 import { motion } from 'framer-motion';
+import { PickupQR } from './PickupQR';
 
 interface QRCodeMessageProps {
     type: 'dropoff' | 'pickup';
@@ -17,9 +18,11 @@ interface QRCodeMessageProps {
     };
     isOwn: boolean;
     timestamp: Date;
+    currentUserId?: string;
 }
 
-export function QRCodeMessage({ type, qrData, isOwn, timestamp }: QRCodeMessageProps) {
+export function QRCodeMessage({ type, qrData, isOwn, timestamp, currentUserId }: QRCodeMessageProps) {
+    const isBuyer = !!currentUserId && qrData.buyerId === currentUserId;
     const config = {
         dropoff: {
             title: '📦 Drop-Off QR',
@@ -40,22 +43,6 @@ export function QRCodeMessage({ type, qrData, isOwn, timestamp }: QRCodeMessageP
     const c = config[type];
     const qrValue = JSON.stringify(qrData);
 
-    const handleDownload = () => {
-        // Create SVG element and convert to data URL
-        const svg = document.querySelector(`#qr-${qrData.tradeId || qrData.listingId}`) as SVGElement;
-        if (svg) {
-            const svgData = new XMLSerializer().serializeToString(svg);
-            const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
-            const url = URL.createObjectURL(svgBlob);
-
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = `reloop-${type}-${qrData.listingId}.svg`;
-            link.click();
-            URL.revokeObjectURL(url);
-        }
-    };
-
     return (
         <motion.div
             initial={{ opacity: 0, scale: 0.95 }}
@@ -68,19 +55,29 @@ export function QRCodeMessage({ type, qrData, isOwn, timestamp }: QRCodeMessageP
                 <span className="font-bold text-dark dark:text-white">{c.title}</span>
             </div>
 
-            {/* QR Code */}
+            {/* QR Code: only the buyer can generate it (the secret is buyer-only) */}
             <div className="p-6 flex flex-col items-center gap-4">
-                <div className="bg-white p-4 rounded-xl shadow-sm">
-                    <QRCodeSVG
-                        id={`qr-${qrData.tradeId || qrData.listingId}`}
-                        value={qrValue}
-                        size={180}
-                        level="H"
-                        includeMargin={true}
-                        bgColor="#ffffff"
-                        fgColor="#1a1a1a"
-                    />
-                </div>
+                {type === 'pickup' && qrData.tradeId && qrData.buyerId ? (
+                    isBuyer ? (
+                        <PickupQR tradeId={qrData.tradeId} buyerId={qrData.buyerId} />
+                    ) : (
+                        <div className="text-center text-sm text-gray-600 dark:text-gray-400">
+                            <span className="material-symbols-outlined text-4xl block mb-1">qr_code_scanner</span>
+                            The buyer will show you a QR at pickup. Scan it from <b>Trade History → Scan Buyer&apos;s QR</b>.
+                        </div>
+                    )
+                ) : (
+                    <div className="bg-white p-4 rounded-xl shadow-sm">
+                        <QRCodeSVG
+                            value={qrValue}
+                            size={180}
+                            level="H"
+                            marginSize={2}
+                            bgColor="#ffffff"
+                            fgColor="#1a1a1a"
+                        />
+                    </div>
+                )}
 
                 {/* Item Info */}
                 <div className="text-center">
@@ -97,14 +94,6 @@ export function QRCodeMessage({ type, qrData, isOwn, timestamp }: QRCodeMessageP
                     {c.instruction}
                 </p>
 
-                {/* Download Button */}
-                <button
-                    onClick={handleDownload}
-                    className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-dark-surface border-2 border-gray-200 dark:border-gray-600 rounded-xl font-medium text-sm hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
-                >
-                    <span className="material-symbols-outlined text-lg">download</span>
-                    Save QR
-                </button>
             </div>
 
             {/* Timestamp */}

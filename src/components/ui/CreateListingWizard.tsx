@@ -6,6 +6,7 @@ import { useAuth } from '@/lib/contexts/AuthContext';
 import { DBService } from '@/lib/firebase/db';
 // StorageService removed - using base64 images directly in Firestore (no billing needed)
 import Image from 'next/image';
+import { downscaleDataUrl } from '@/lib/image';
 import { motion, AnimatePresence } from 'framer-motion';
 import dynamic from 'next/dynamic';
 import type { WebcamCaptureRef } from '@/components/scanner/WebcamCapture';
@@ -101,8 +102,9 @@ export function CreateListingWizard({ isOpen, onClose, onSuccess }: CreateListin
 
     // Capture photo and analyze
     const capturePhoto = useCallback(async () => {
-        const imageSrc = webcamRef.current?.getScreenshot();
-        if (!imageSrc) return;
+        const rawShot = webcamRef.current?.getScreenshot();
+        if (!rawShot) return;
+        const imageSrc = await downscaleDataUrl(rawShot);
 
         setCapturedImage(imageSrc);
         setCameraState('captured');
@@ -157,7 +159,7 @@ export function CreateListingWizard({ isOpen, onClose, onSuccess }: CreateListin
 
         const reader = new FileReader();
         reader.onloadend = async () => {
-            const imageSrc = reader.result as string;
+            const imageSrc = await downscaleDataUrl(reader.result as string);
             setCapturedImage(imageSrc);
             setCameraState('captured');
             setImagePreviews([imageSrc]);
@@ -244,7 +246,7 @@ export function CreateListingWizard({ isOpen, onClose, onSuccess }: CreateListin
                     furniture: 'https://images.unsplash.com/photo-1555041469-a586c61ea9bc?w=400',
                     clothing: 'https://images.unsplash.com/photo-1445205170230-053b83016050?w=400',
                     books: 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=400',
-                    sports: 'https://images.unsplash.com/photo-1461896836934- voices?w=400',
+                    sports: 'https://images.unsplash.com/photo-1461896836934-ffe607ba8211?w=400',
                     other: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=400'
                 };
                 imageUrls = [placeholders[formData.category] || placeholders.other];

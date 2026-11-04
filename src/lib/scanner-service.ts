@@ -80,11 +80,10 @@ export const ScannerService = {
             DemoManager.saveScan(result); // Persist to history
             return result;
         } catch (error) {
+            // Previously this returned a RANDOM category as a successful scan, which then
+            // looked real (and rewarded XP). Surface the failure instead.
             console.error('AI Analysis failed:', error);
-            // Fallback to local analysis
-            const result = this.localFallbackAnalysis();
-            this.storeResult(result, imageData);
-            return result;
+            throw new Error('Could not identify this item right now. Please try again.');
         }
     },
 

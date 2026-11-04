@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import DemoManager from '@/lib/demo-manager';
+import { useAuth } from '@/lib/contexts/AuthContext';
 import { User } from '@/types';
 
 const containerVariants = {
@@ -16,6 +17,7 @@ const itemVariants = {
 };
 
 export default function AdminPage() {
+    const { isDemo, isLoading: authLoading } = useAuth();
     const [user, setUser] = useState<User | null>(null);
     const [allData, setAllData] = useState<any>(null);
     const [activeTab, setActiveTab] = useState<'user' | 'badges' | 'listings' | 'trades' | 'stats'>('user');
@@ -85,6 +87,21 @@ export default function AdminPage() {
         return (
             <div className="min-h-screen bg-dark flex items-center justify-center">
                 <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+            </div>
+        );
+    }
+
+    if (authLoading) return null;
+    if (!isDemo) {
+        // This panel edits the local demo dataset only. For real accounts it would
+        // look like it worked while changing nothing, so don't offer it.
+        return (
+            <div className="min-h-screen bg-background flex flex-col items-center justify-center p-6 text-center">
+                <span className="material-symbols-outlined text-6xl text-dark/30 dark:text-white/30 mb-4">admin_panel_settings</span>
+                <h1 className="text-xl font-black text-dark dark:text-white mb-2">Demo admin panel</h1>
+                <p className="text-sm text-dark/60 dark:text-white/60 max-w-xs">
+                    This panel only edits demo data. Manage real users and roles from the Firebase console.
+                </p>
             </div>
         );
     }

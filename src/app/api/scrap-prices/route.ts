@@ -45,7 +45,7 @@ function classifyMaterial(materialName: string): string {
     return 'other';
 }
 
-export async function GET(request: NextRequest) {
+export async function GET(_request: NextRequest) {
     try {
         // Fetch Indian Scrap Prices page
         const response = await fetch('https://www.recycleinme.com/scrappricelisting/Indian%20Scrap%20Prices', {
@@ -78,7 +78,7 @@ export async function GET(request: NextRequest) {
                 const priceMatch = priceText.match(/[\d,]+(?:\.\d+)?/);
 
                 if (material && priceMatch) {
-                    const price = parseFloat(priceMatch[0].replace(',', ''));
+                    const price = parseFloat(priceMatch[0].replace(/,/g, ''));
                     if (!isNaN(price)) {
                         prices.push({
                             material,
@@ -101,7 +101,7 @@ export async function GET(request: NextRequest) {
 
             if (priceMatch) {
                 const material = text.split(/[₹\d]/)[0].trim();
-                const price = parseFloat(priceMatch[1].replace(',', ''));
+                const price = parseFloat(priceMatch[1].replace(/,/g, ''));
 
                 if (material && material.length > 2 && material.length < 50 && !isNaN(price)) {
                     prices.push({

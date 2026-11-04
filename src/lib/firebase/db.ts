@@ -15,10 +15,36 @@ import {
     limit,
     increment,
     Unsubscribe,
-    runTransaction
+    runTransaction,
+    writeBatch,
+    Timestamp
 } from "firebase/firestore";
 import { db } from "./client";
 import { Listing, User, Trade } from "@/types";
+import {
+    normalizeBagCode,
+    generatePickupCode,
+    bagPayout,
+    levelFromXp,
+    BAG_MAX_WEIGHT_KG
+} from "@/lib/qr";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+function isPermissionDenied(e: unknown): boolean {
+    return (e as { code?: string })?.code === 'permission-denied';
+}
+
+/** Firestore Timestamp | Date | undefined -> epoch millis (0 if unknown). */
+function toMillis(v: any): number {
+    if (!v) return 0;
+    if (typeof v.toMillis === 'function') return v.toMillis();
+    if (v instanceof Date) return v.getTime();
+    return 0;
+}
+
+const MAX_OFFER_COINS = 1_000_000;
+const HIDDEN_LISTING_STATUSES = ['sold', 'donated', 'recycled'];
 
 export const DBService = {
     // USERS
@@ -48,28 +74,6 @@ export const DBService = {
         });
     },
 
-    async addCoinsToUser(uid: string, amount: number, reason: string): Promise<void> {
-        await runTransaction(db, async (transaction) => {
-            const userRef = doc(db, "users", uid);
-            const userDoc = await transaction.get(userRef);
-            const currentCoins = userDoc.data()?.coins || 0;
-
-            transaction.update(userRef, {
-                coins: currentCoins + amount
-            });
-
-            // Log coin transaction
-            const logRef = doc(collection(db, "coinTransactions"));
-            transaction.set(logRef, {
-                userId: uid,
-                amount,
-                reason,
-                balanceAfter: currentCoins + amount,
-                createdAt: serverTimestamp()
-            });
-        });
-    },
-
     subscribeToUserProfile(uid: string, callback: (user: User | null) => void): Unsubscribe {
         return onSnapshot(doc(db, "users", uid), (docSnap) => {
             if (docSnap.exists()) {
@@ -81,25 +85,30 @@ export const DBService = {
     },
 
     // SMART BAGS
+    // The document id IS the (normalised) QR code, so a QR can only be registered once.
     async createSmartBag(data: { qrCode: string; userId: string; ownerName?: string }): Promise<string> {
-        // Check if QR already registered
-        const existing = await getDocs(
-            query(collection(db, 'smartBags'), where('qrCode', '==', data.qrCode))
-        );
-        if (!existing.empty) {
-            throw new Error('This bag is already registered');
+        const code = normalizeBagCode(data.qrCode);
+        if (!code) {
+            throw new Error("That doesn't look like a ReLoop bag QR code.");
         }
 
-        const newRef = doc(collection(db, 'smartBags'));
-        await setDoc(newRef, {
-            id: newRef.id,
-            qrCode: data.qrCode,
-            ownerId: data.userId,
-            ownerName: data.ownerName || 'Unknown',
-            status: 'registered',
-            registeredAt: serverTimestamp()
-        });
-        return newRef.id;
+        try {
+            await setDoc(doc(db, 'smartBags', code), {
+                id: code,
+                qrCode: code,
+                ownerId: data.userId,
+                ownerName: data.ownerName || 'Unknown',
+                status: 'registered',
+                registeredAt: serverTimestamp()
+            });
+        } catch (error) {
+            // Creating over an existing doc is evaluated as an update, which the rules deny.
+            if (isPermissionDenied(error)) {
+                throw new Error('This bag is already registered');
+            }
+            throw error;
+        }
+        return code;
     },
 
     async getUserSmartBags(userId: string): Promise<any[]> {
@@ -117,12 +126,117 @@ export const DBService = {
         }
     },
 
-    async updateSmartBagStatus(bagId: string, status: string, extraData?: Record<string, any>): Promise<void> {
-        await updateDoc(doc(db, 'smartBags', bagId), {
-            status,
-            [`${status}At`]: serverTimestamp(),
-            ...extraData
+    /** Owner marks a registered bag as filled (ready for collection). */
+    async markBagFilled(bagId: string, ownerId: string): Promise<void> {
+        const bagRef = doc(db, 'smartBags', bagId);
+        await runTransaction(db, async (tx) => {
+            const snap = await tx.get(bagRef);
+            if (!snap.exists()) throw new Error('Bag not found');
+            const bag = snap.data();
+            if (bag.ownerId !== ownerId) throw new Error('This is not your bag');
+            if (bag.status !== 'registered') throw new Error(`This bag is already ${bag.status}`);
+            tx.update(bagRef, {
+                status: 'filled',
+                filledAt: serverTimestamp(),
+                wasteType: 'recyclable'
+            });
         });
+        // Mission progress is best-effort and must never fail the fill itself.
+        await this.updateDailyMissionProgress(ownerId, 'bagsFilledToday');
+    },
+
+    /**
+     * Staff (worker/admin) collects a FILLED bag: records the weight, marks it processed
+     * and pays the owner, atomically. Payout = 10 coins/kg (enforced again in firestore.rules).
+     */
+    async collectSmartBag(
+        bagId: string,
+        workerId: string,
+        weightKg: number,
+        opts?: { coins?: number; materials?: string[] }
+    ): Promise<{ coinsAwarded: number; ownerId: string; ownerName: string }> {
+        if (!Number.isFinite(weightKg) || weightKg <= 0 || weightKg > BAG_MAX_WEIGHT_KG) {
+            throw new Error(`Weight must be between 0 and ${BAG_MAX_WEIGHT_KG} kg`);
+        }
+        // One decimal place, like a kitchen scale.
+        const weight = Math.round(weightKg * 10) / 10;
+        if (weight <= 0) throw new Error('Weight is too small');
+        // Default 10 coins/kg; staff apps with material pricing pass their own total (rules cap it at 25/kg).
+        const coinsAwarded = opts?.coins ?? bagPayout(weight);
+        if (!Number.isInteger(coinsAwarded) || coinsAwarded < 0) throw new Error('Invalid payout');
+        const xpAwarded = Math.round(weight * 25);
+        const co2 = Math.min(50, Math.round(weight * 2.5 * 10) / 10);
+
+        const bagRef = doc(db, 'smartBags', bagId);
+        let ownerId = '';
+        let ownerName = '';
+
+        await runTransaction(db, async (tx) => {
+            const bagSnap = await tx.get(bagRef);
+            if (!bagSnap.exists()) throw new Error('Bag not found');
+            const bag = bagSnap.data();
+            if (bag.status !== 'filled') {
+                throw new Error(
+                    bag.status === 'processed' || bag.status === 'collected'
+                        ? 'This bag was already collected'
+                        : 'This bag has not been marked as filled yet'
+                );
+            }
+            if (bag.ownerId === workerId) {
+                throw new Error("You can't collect your own bag");
+            }
+
+            const ownerRef = doc(db, 'users', bag.ownerId);
+            const ownerSnap = await tx.get(ownerRef);
+            if (!ownerSnap.exists()) throw new Error('Bag owner account not found');
+            const owner = ownerSnap.data();
+            ownerId = bag.ownerId;
+            ownerName = bag.ownerName || owner.name || 'User';
+
+            tx.update(bagRef, {
+                status: 'processed',
+                collectedAt: serverTimestamp(),
+                processedAt: serverTimestamp(),
+                collectedBy: workerId,
+                processedBy: workerId,
+                estimatedWeight: weight,
+                actualWeight: weight,
+                ...(opts?.materials ? { materials: opts.materials } : {}),
+                coinsAwarded,
+                xpAwarded
+            });
+            const newXp = (owner.xp || 0) + xpAwarded;
+            tx.update(ownerRef, {
+                coins: (owner.coins || 0) + coinsAwarded,
+                xp: newXp,
+                level: Math.max(owner.level || 1, levelFromXp(newXp)),
+                bagsRecycled: (owner.bagsRecycled || 0) + 1,
+                co2Saved: (owner.co2Saved || 0) + co2,
+                lastBagId: bagId,
+                updatedAt: serverTimestamp()
+            });
+            tx.set(doc(collection(db, 'coinTransactions')), {
+                userId: bag.ownerId,
+                byUid: workerId,
+                amount: coinsAwarded,
+                reason: 'Smart bag collection',
+                refId: bagId,
+                createdAt: serverTimestamp()
+            });
+            tx.set(doc(collection(db, 'notifications')), {
+                userId: bag.ownerId,
+                fromUserId: workerId,
+                type: 'coin',
+                title: 'Bag Collected! ♻️',
+                message: `Your smart bag (${weight} kg) was collected. You earned ${coinsAwarded} coins!`,
+                icon: 'shopping_bag',
+                actionUrl: `/smart-bags/${bagId}`,
+                read: false,
+                createdAt: serverTimestamp()
+            });
+        });
+
+        return { coinsAwarded, ownerId, ownerName };
     },
 
     async getSmartBagById(bagId: string): Promise<any | null> {
@@ -133,9 +247,14 @@ export const DBService = {
         return null;
     },
 
-    async getSmartBagByQR(qrCode: string): Promise<any | null> {
-        const q = query(collection(db, 'smartBags'), where('qrCode', '==', qrCode));
-        const snapshot = await getDocs(q);
+    /** Look a bag up by the text of its QR code (staff only: owners can only read their own bags). */
+    async getSmartBagByQR(rawCode: string): Promise<any | null> {
+        const code = normalizeBagCode(rawCode);
+        if (!code) return null;
+        const direct = await getDoc(doc(db, 'smartBags', code));
+        if (direct.exists()) return { id: direct.id, ...direct.data() };
+        // Legacy bags were created with random ids.
+        const snapshot = await getDocs(query(collection(db, 'smartBags'), where('qrCode', '==', code)));
         if (snapshot.empty) return null;
         return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
     },
@@ -147,6 +266,10 @@ export const DBService = {
             } else {
                 callback(null);
             }
+        }, (error) => {
+            // Without this a permission error left the UI on a spinner forever.
+            console.error('Error subscribing to smart bag:', error);
+            callback(null);
         });
     },
 
@@ -196,12 +319,23 @@ export const DBService = {
                 id: doc.id,
                 ...doc.data()
             })) as Listing[];
-            // Filter out sold items client-side
-            return allListings.filter(listing => listing.status !== 'sold');
+            // Hide items that have left the marketplace (sold / donated / recycled)
+            return allListings.filter(listing => !HIDDEN_LISTING_STATUSES.includes(listing.status as string));
         } catch (error) {
             console.error("Error fetching listings:", error);
             return [];
         }
+    },
+
+    /** Realtime marketplace feed (replaces re-downloading every listing every 5s). */
+    subscribeToListings(callback: (listings: Listing[]) => void): Unsubscribe {
+        const q = query(collection(db, "listings"), orderBy("createdAt", "desc"));
+        return onSnapshot(q, (snapshot) => {
+            const all = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as Listing[];
+            callback(all.filter(l => !HIDDEN_LISTING_STATUSES.includes(l.status as string)));
+        }, (error) => {
+            console.error("Error subscribing to listings:", error);
+        });
     },
 
     async getListingById(id: string): Promise<Listing | null> {
@@ -254,7 +388,7 @@ export const DBService = {
         }
     },
 
-    async updateListingStatus(listingId: string, status: 'available' | 'sold' | 'pending'): Promise<boolean> {
+    async updateListingStatus(listingId: string, status: 'available' | 'sold' | 'pending' | 'reserved'): Promise<boolean> {
         try {
             const docRef = doc(db, "listings", listingId);
             await updateDoc(docRef, { status, updatedAt: serverTimestamp() });
@@ -334,7 +468,8 @@ export const DBService = {
         senderId: string,
         text: string,
         messageType: 'text' | 'offer' | 'system' = 'text',
-        offerAmount?: number
+        offerAmount?: number,
+        extra?: { tradeId?: string }
     ) {
         try {
             const messagesRef = collection(db, "conversations", conversationId, "messages");
@@ -347,9 +482,10 @@ export const DBService = {
             };
 
             // Add offer-specific fields
-            if (messageType === 'offer' && offerAmount) {
-                messageData.offerAmount = offerAmount;
+            if (messageType === 'offer') {
+                messageData.offerAmount = offerAmount ?? 0;
                 messageData.offerStatus = 'pending';
+                if (extra?.tradeId) messageData.tradeId = extra.tradeId;
             }
 
             const docRef = await addDoc(messagesRef, messageData);
@@ -365,7 +501,7 @@ export const DBService = {
             });
 
             // Notify the OTHER participant(s) for real messages (not system messages)
-            if (messageType !== 'system' && senderId !== 'system') {
+            if (messageType !== 'system') {
                 try {
                     const convSnap = await getDoc(convRef);
                     const convData = convSnap.data();
@@ -375,6 +511,7 @@ export const DBService = {
                         const notifRef = doc(collection(db, "notifications"));
                         await setDoc(notifRef, {
                             userId: recipientId,
+                            fromUserId: senderId,
                             type: 'message',
                             title: messageType === 'offer' ? 'New Offer! 💰' : 'New Message 💬',
                             message: messageType === 'offer'
@@ -382,6 +519,7 @@ export const DBService = {
                                 : text.length > 80 ? text.substring(0, 80) + '…' : text,
                             icon: messageType === 'offer' ? 'local_offer' : 'chat',
                             conversationId,
+                            actionUrl: `/messages/${conversationId}`,
                             read: false,
                             createdAt: serverTimestamp()
                         });
@@ -399,76 +537,16 @@ export const DBService = {
         }
     },
 
-    // Send an offer message in chat
-    async sendOffer(conversationId: string, senderId: string, amount: number, listingTitle?: string) {
+    // Send an offer message in chat (prefer makeOffer(), which also creates the trade).
+    async sendOffer(conversationId: string, senderId: string, amount: number, listingTitle?: string, tradeId?: string) {
         const text = `I'd like to offer ${amount} coins${listingTitle ? ` for "${listingTitle}"` : ''}. Let me know if that works!`;
-        return await this.sendMessage(conversationId, senderId, text, 'offer', amount);
+        return await this.sendMessage(conversationId, senderId, text, 'offer', amount, { tradeId });
     },
 
-    // Update offer status (accept/decline/counter)
-    async updateOfferStatus(
-        conversationId: string,
-        messageId: string,
-        status: 'accepted' | 'declined' | 'countered',
-        counterAmount?: number,
-        offerAmount?: number,
-        listingId?: string,
-        listingTitle?: string,
-        sellerId?: string,
-        buyerId?: string
-    ) {
-        try {
-            const messageRef = doc(db, "conversations", conversationId, "messages", messageId);
-            const updateData: any = { offerStatus: status };
-            if (status === 'countered' && counterAmount) {
-                updateData.counterAmount = counterAmount;
-            }
-            await updateDoc(messageRef, updateData);
-
-            // Add system message about the status change
-            const statusMessages = {
-                accepted: '✅ Offer accepted! Deal confirmed.',
-                declined: '❌ Offer declined.',
-                countered: `🔄 Counter offer: ${counterAmount} coins`,
-            };
-            await this.sendMessage(conversationId, 'system', statusMessages[status], 'system');
-
-            // If accepted, update conversation deal status and send QR to buyer
-            if (status === 'accepted') {
-                const convRef = doc(db, "conversations", conversationId);
-                const amount = offerAmount || counterAmount || 0;
-
-                // Generate trade ID for this transaction
-                const tradeId = `trade_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-                await updateDoc(convRef, {
-                    dealStatus: 'agreed',
-                    agreedAmount: amount,
-                    tradeId: tradeId,
-                });
-
-                // Send QR code message to the buyer
-                if (listingId && buyerId) {
-                    await this.sendQRMessage(conversationId, {
-                        type: 'pickup',
-                        tradeId,
-                        listingId,
-                        listingTitle: listingTitle || 'Item',
-                        sellerId: sellerId || '',
-                        buyerId,
-                        amount,
-                    });
-                }
-            }
-        } catch (error) {
-            console.error("Error updating offer status:", error);
-            throw error;
-        }
-    },
-
-    // Send a QR code message in chat
+    // Send a QR code message in chat. `senderId` must be the signed-in user who triggered it.
     async sendQRMessage(
         conversationId: string,
+        senderId: string,
         qrData: {
             type: 'dropoff' | 'pickup';
             tradeId?: string;
@@ -482,21 +560,21 @@ export const DBService = {
         try {
             const messagesRef = collection(db, "conversations", conversationId, "messages");
             await addDoc(messagesRef, {
-                senderId: 'system',
+                senderId,
                 type: 'qr',
                 qrType: qrData.type,
+                // NOTE: never put the pickup code in here - the seller can read this message.
                 qrData: {
                     ...qrData,
                     createdAt: new Date().toISOString(),
                 },
                 text: qrData.type === 'pickup'
-                    ? `🎉 Show this QR at the ReLoop Zone to pick up "${qrData.listingTitle}"`
+                    ? `🎉 Show this QR to the seller to pick up "${qrData.listingTitle}"`
                     : `📦 Show this QR to drop off "${qrData.listingTitle}"`,
                 timestamp: serverTimestamp(),
                 read: false,
             });
 
-            // Update last message
             const convRef = doc(db, "conversations", conversationId);
             await updateDoc(convRef, {
                 lastMessage: `📱 QR Code sent for ${qrData.type}`,
@@ -620,9 +698,74 @@ export const DBService = {
     },
 
     // TRADES
+    // Lifecycle: pending --accept--> accepted --(seller scans buyer's pickup QR)--> completed
+    //            pending --decline/cancel--> declined/cancelled ; accepted --cancel--> cancelled
+    // Coins only move at `completed`, atomically (see completeTrade + firestore.rules).
+
+    /** Buyer makes an offer: creates the trade, opens/finds the chat and posts the offer card. */
+    async makeOffer(params: {
+        listing: Listing;
+        buyer: { uid: string; name?: string; avatar?: string };
+        coins: number;
+        offeredItem?: string;
+    }): Promise<{ tradeId: string; conversationId: string }> {
+        const { listing, buyer } = params;
+        const coins = Math.floor(Number(params.coins) || 0);
+        const offeredItem = params.offeredItem?.trim() || undefined;
+
+        if (!listing?.seller?.id) throw new Error('Seller information is missing');
+        if (listing.seller.id === buyer.uid) throw new Error("You can't make an offer on your own listing");
+        if (coins < 0 || coins > MAX_OFFER_COINS) throw new Error('Offer amount is out of range');
+        if (coins === 0 && !offeredItem) throw new Error('Enter a coin amount or an item to swap');
+
+        const fresh = await this.getListingById(listing.id);
+        if (!fresh) throw new Error('This listing no longer exists');
+        if (fresh.status !== 'available') throw new Error('This item is no longer available');
+
+        if (coins > 0) {
+            const profile = await this.getUserProfile(buyer.uid);
+            if ((profile?.coins || 0) < coins) throw new Error("You don't have enough coins for this offer");
+        }
+
+        const existing = await getDocs(query(
+            collection(db, 'trades'),
+            where('traderId', '==', buyer.uid),
+            where('listingId', '==', listing.id),
+            where('status', '==', 'pending')
+        ));
+        if (!existing.empty) throw new Error('You already have a pending offer on this item');
+
+        const tradeId = await this.createTrade({
+            listingId: listing.id,
+            listingTitle: listing.title || 'Untitled',
+            listingImage: listing.images?.[0] || '',
+            sellerId: listing.seller.id,
+            sellerName: listing.seller.name || 'Seller',
+            sellerAvatar: listing.seller.avatar || '',
+            traderId: buyer.uid,
+            traderName: buyer.name || 'User',
+            traderAvatar: buyer.avatar || '',
+            status: 'pending',
+            ...(offeredItem ? { offeredItem } : {}),
+            ...(coins > 0 ? { offeredCoins: coins } : {}),
+        });
+
+        const conversationId = await this.findOrCreateConversation(
+            buyer.uid,
+            listing.seller.id,
+            listing.id,
+            listing.title,
+            listing.images?.[0],
+            listing.price,
+            listing.seller.name,
+            listing.seller.avatar
+        );
+        await this.sendOffer(conversationId, buyer.uid, coins, listing.title, tradeId);
+        return { tradeId, conversationId };
+    },
+
     async createTrade(tradeData: Omit<Trade, 'id' | 'createdAt'>): Promise<string> {
         try {
-            // Updated to single-write pattern
             const newRef = doc(collection(db, "trades"));
             await setDoc(newRef, {
                 ...tradeData,
@@ -631,27 +774,6 @@ export const DBService = {
                 updatedAt: serverTimestamp(),
                 status: 'pending'
             });
-
-            // Notify the seller that they have a new trade offer
-            if (tradeData.sellerId) {
-                try {
-                    const notifRef = doc(collection(db, "notifications"));
-                    await setDoc(notifRef, {
-                        userId: tradeData.sellerId,
-                        type: 'trade',
-                        title: 'New Trade Offer! 🤝',
-                        message: `Someone wants to trade for "${(tradeData as any).listingTitle || 'your item'}".`,
-                        icon: 'swap_horiz',
-                        tradeId: newRef.id,
-                        read: false,
-                        createdAt: serverTimestamp()
-                    });
-                } catch (notifErr) {
-                    // Non-fatal — trade already created
-                    console.error('Failed to create trade notification:', notifErr);
-                }
-            }
-
             return newRef.id;
         } catch (error) {
             console.error("Error creating trade:", error);
@@ -661,154 +783,318 @@ export const DBService = {
 
     async getUserTrades(userId: string): Promise<Trade[]> {
         try {
-            // Get trades where user is seller
-            const sellerQuery = query(
-                collection(db, "trades"),
-                where("sellerId", "==", userId),
-                orderBy("createdAt", "desc")
-            );
-            const sellerSnapshot = await getDocs(sellerQuery);
+            const [sellerSnapshot, traderSnapshot] = await Promise.all([
+                getDocs(query(collection(db, "trades"), where("sellerId", "==", userId), orderBy("createdAt", "desc"))),
+                getDocs(query(collection(db, "trades"), where("traderId", "==", userId), orderBy("createdAt", "desc")))
+            ]);
 
-            // Get trades where user is trader (buyer)
-            const traderQuery = query(
-                collection(db, "trades"),
-                where("traderId", "==", userId),
-                orderBy("createdAt", "desc")
-            );
-            const traderSnapshot = await getDocs(traderQuery);
-
-            const allTrades = [
-                ...sellerSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Trade)),
-                ...traderSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Trade))
-            ];
-
-            // Sort by createdAt descending
-            return allTrades.sort((a, b) => {
-                const aTime = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
-                const bTime = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
-                return bTime - aTime;
+            const byId = new Map<string, Trade>();
+            [...sellerSnapshot.docs, ...traderSnapshot.docs].forEach(d => {
+                byId.set(d.id, { ...d.data(), id: d.id } as Trade);
             });
+
+            // createdAt is a Firestore Timestamp (not a Date) - compare by millis.
+            return Array.from(byId.values()).sort(
+                (a, b) => toMillis(b.createdAt) - toMillis(a.createdAt)
+            );
         } catch (error) {
             console.error("Error fetching trades:", error);
             return [];
         }
     },
 
-    async updateTradeStatus(
-        tradeId: string,
-        status: 'accepted' | 'declined' | 'completed',
-        additionalData?: Record<string, any>
-    ) {
-        try {
-            const tradeRef = doc(db, "trades", tradeId);
-            const tradeSnap = await getDoc(tradeRef);
-            const tradeData = tradeSnap.data();
+    /** Seller accepts an offer: reserves the listing; other pending offers are declined. */
+    async acceptTrade(params: {
+        tradeId: string;
+        sellerId: string;
+        conversationId?: string;
+        messageId?: string;
+    }): Promise<{ conversationId: string }> {
+        const { tradeId, sellerId } = params;
+        const tradeRef = doc(db, 'trades', tradeId);
+        let trade: any = null;
 
-            await updateDoc(tradeRef, {
-                status,
-                updatedAt: serverTimestamp(),
-                ...(status === 'completed' ? { completedAt: serverTimestamp() } : {}),
-                ...additionalData
-            });
+        await runTransaction(db, async (tx) => {
+            const snap = await tx.get(tradeRef);
+            if (!snap.exists()) throw new Error('Offer not found');
+            const t = snap.data();
+            if (t.sellerId !== sellerId) throw new Error('Only the seller can accept this offer');
+            if (t.status !== 'pending') throw new Error(`This offer is already ${t.status}`);
 
-            // On completion: mark listing as sold and increment co2Saved for seller
-            if (status === 'completed' && tradeData) {
-                const co2PerTrade = 2.5; // kg CO2 saved per successful trade
-
-                // Mark the listing as sold
-                if (tradeData.listingId) {
-                    try {
-                        await updateDoc(doc(db, "listings", tradeData.listingId), {
-                            status: 'sold',
-                            soldAt: serverTimestamp()
-                        });
-                    } catch (e) {
-                        console.error('Failed to mark listing as sold:', e);
-                    }
-                }
-
-                // Increment co2Saved for both seller and buyer
-                const usersToUpdate = [
-                    tradeData.sellerId,
-                    tradeData.traderId
-                ].filter(Boolean);
-
-                for (const uid of usersToUpdate) {
-                    try {
-                        await updateDoc(doc(db, "users", uid), {
-                            co2Saved: increment(co2PerTrade),
-                            itemsTraded: increment(1)
-                        });
-                    } catch (e) {
-                        console.error('Failed to increment co2Saved for', uid, e);
-                    }
-                }
-
-                // Notify both parties the trade is complete
-                const parties = [
-                    { uid: tradeData.sellerId, role: 'seller' },
-                    { uid: tradeData.traderId, role: 'buyer' }
-                ].filter(p => p.uid);
-
-                for (const party of parties) {
-                    try {
-                        const notifRef = doc(collection(db, "notifications"));
-                        await setDoc(notifRef, {
-                            userId: party.uid,
-                            type: 'trade',
-                            title: 'Trade Complete! 🎉',
-                            message: `Your trade for "${tradeData.listingTitle || 'an item'}" is done. You earned +${co2PerTrade}kg CO₂ saved!`,
-                            icon: 'check_circle',
-                            tradeId,
-                            read: false,
-                            createdAt: serverTimestamp()
-                        });
-                    } catch (e) {
-                        console.error('Failed to create completion notification:', e);
-                    }
-                }
+            const listingRef = doc(db, 'listings', t.listingId);
+            const listingSnap = await tx.get(listingRef);
+            if (!listingSnap.exists()) throw new Error('This listing no longer exists');
+            if (listingSnap.data().status !== 'available') {
+                throw new Error('This item is already reserved or sold');
             }
+
+            tx.update(tradeRef, {
+                status: 'accepted',
+                agreedCoins: t.offeredCoins || 0,
+                acceptedAt: serverTimestamp(),
+                updatedAt: serverTimestamp()
+            });
+            tx.update(listingRef, { status: 'pending', updatedAt: serverTimestamp() });
+            if (params.conversationId && params.messageId) {
+                tx.update(
+                    doc(db, 'conversations', params.conversationId, 'messages', params.messageId),
+                    { offerStatus: 'accepted' }
+                );
+            }
+            trade = { id: tradeId, ...t, agreedCoins: t.offeredCoins || 0 };
+        });
+
+        // ---- best-effort follow-ups (the deal itself is already safely recorded) ----
+        try {
+            const others = await getDocs(query(
+                collection(db, 'trades'),
+                where('listingId', '==', trade.listingId),
+                where('sellerId', '==', sellerId),
+                where('status', '==', 'pending')
+            ));
+            if (!others.empty) {
+                const batch = writeBatch(db);
+                others.docs.forEach(d => batch.update(d.ref, { status: 'declined', updatedAt: serverTimestamp() }));
+                await batch.commit();
+            }
+        } catch (e) {
+            console.error('Failed to decline competing offers:', e);
+        }
+
+        let conversationId = params.conversationId || '';
+        try {
+            if (!conversationId) {
+                conversationId = await this.findOrCreateConversation(
+                    sellerId, trade.traderId, trade.listingId, trade.listingTitle,
+                    trade.listingImage, undefined, trade.traderName, trade.traderAvatar
+                );
+            }
+            await this.sendMessage(conversationId, sellerId, '✅ Offer accepted! Deal confirmed.', 'system');
+            await this.sendQRMessage(conversationId, sellerId, {
+                type: 'pickup',
+                tradeId,
+                listingId: trade.listingId,
+                listingTitle: trade.listingTitle || 'Item',
+                sellerId,
+                buyerId: trade.traderId,
+                amount: trade.agreedCoins,
+            });
+            await this.createNotification({
+                userId: trade.traderId,
+                fromUserId: sellerId,
+                type: 'trade',
+                title: 'Offer Accepted! 🎉',
+                message: `Your offer for "${trade.listingTitle || 'an item'}" was accepted. Show your pickup QR to the seller.`,
+                icon: 'check_circle',
+                actionUrl: `/messages/${conversationId}`
+            });
+        } catch (e) {
+            console.error('Failed to post acceptance messages:', e);
+        }
+
+        return { conversationId };
+    },
+
+    async declineTrade(params: {
+        tradeId: string;
+        sellerId: string;
+        conversationId?: string;
+        messageId?: string;
+    }): Promise<void> {
+        const tradeRef = doc(db, 'trades', params.tradeId);
+        let trade: any = null;
+        await runTransaction(db, async (tx) => {
+            const snap = await tx.get(tradeRef);
+            if (!snap.exists()) throw new Error('Offer not found');
+            const t = snap.data();
+            if (t.sellerId !== params.sellerId) throw new Error('Only the seller can decline this offer');
+            if (t.status !== 'pending') throw new Error(`This offer is already ${t.status}`);
+            tx.update(tradeRef, { status: 'declined', updatedAt: serverTimestamp() });
+            if (params.conversationId && params.messageId) {
+                tx.update(
+                    doc(db, 'conversations', params.conversationId, 'messages', params.messageId),
+                    { offerStatus: 'declined' }
+                );
+            }
+            trade = t;
+        });
+        try {
+            if (params.conversationId) {
+                await this.sendMessage(params.conversationId, params.sellerId, '❌ Offer declined.', 'system');
+            }
+            await this.createNotification({
+                userId: trade.traderId,
+                fromUserId: params.sellerId,
+                type: 'trade',
+                title: 'Offer Declined',
+                message: `Your offer for "${trade.listingTitle || 'an item'}" was declined.`,
+                icon: 'cancel'
+            });
+        } catch (e) {
+            console.error('Failed to post decline follow-ups:', e);
+        }
+    },
+
+    /** Buyer withdraws a pending offer. */
+    async cancelOffer(tradeId: string, buyerId: string): Promise<void> {
+        const tradeRef = doc(db, 'trades', tradeId);
+        await runTransaction(db, async (tx) => {
+            const snap = await tx.get(tradeRef);
+            if (!snap.exists()) throw new Error('Offer not found');
+            const t = snap.data();
+            if (t.traderId !== buyerId) throw new Error('Only the buyer can withdraw this offer');
+            if (t.status !== 'pending') throw new Error(`This offer is already ${t.status}`);
+            tx.update(tradeRef, { status: 'cancelled', updatedAt: serverTimestamp() });
+        });
+    },
+
+    /** Seller backs out of an accepted deal: the item goes back on the marketplace. */
+    async cancelAcceptedTrade(tradeId: string, sellerId: string): Promise<void> {
+        const tradeRef = doc(db, 'trades', tradeId);
+        await runTransaction(db, async (tx) => {
+            const snap = await tx.get(tradeRef);
+            if (!snap.exists()) throw new Error('Deal not found');
+            const t = snap.data();
+            if (t.sellerId !== sellerId) throw new Error('Only the seller can cancel this deal');
+            if (t.status !== 'accepted') throw new Error(`This deal is already ${t.status}`);
+            tx.update(tradeRef, { status: 'cancelled', updatedAt: serverTimestamp() });
+            tx.update(doc(db, 'listings', t.listingId), { status: 'available', updatedAt: serverTimestamp() });
+        });
+    },
+
+    /**
+     * Buyer-side: get (or create once) the secret behind the pickup QR.
+     * Stored in trades/{id}/secrets/pickup, which only the buyer can read.
+     */
+    async getOrCreatePickupSecret(tradeId: string, buyerId: string): Promise<string> {
+        const tradeSnap = await getDoc(doc(db, 'trades', tradeId));
+        if (!tradeSnap.exists()) throw new Error('Deal not found');
+        const trade = tradeSnap.data();
+        if (trade.traderId !== buyerId) throw new Error('Only the buyer has a pickup QR');
+        if (trade.status !== 'accepted') throw new Error(`This deal is ${trade.status}`);
+
+        const secretRef = doc(db, 'trades', tradeId, 'secrets', 'pickup');
+        const existing = await getDoc(secretRef);
+        if (existing.exists()) return existing.data().code as string;
+
+        const code = generatePickupCode();
+        try {
+            await setDoc(secretRef, { code, createdAt: serverTimestamp() });
+            return code;
         } catch (error) {
-            console.error("Error updating trade status:", error);
+            // Another tab created it first (secrets are write-once): read theirs.
+            const again = await getDoc(secretRef);
+            if (again.exists()) return again.data().code as string;
             throw error;
         }
     },
 
-    // COIN TRANSFER (Atomic Transaction)
-    async transferCoins(fromUserId: string, toUserId: string, amount: number) {
+    /**
+     * Seller-side: the buyer showed their pickup QR / code. Verifies it and settles:
+     * coins move buyer -> seller, listing is marked sold, stats + ledger + notifications
+     * are written, all in ONE transaction. The code check is enforced by firestore.rules.
+     */
+    async completeTrade(params: {
+        tradeId: string;
+        code: string;
+        /** The signed-in user completing the deal: the seller, or ReLoop zone staff. */
+        sellerId: string;
+    }): Promise<{ coins: number; listingTitle: string }> {
+        const code = params.code.trim().toUpperCase();
+        const tradeRef = doc(db, 'trades', params.tradeId);
+        let result = { coins: 0, listingTitle: '' };
+
         try {
-            await runTransaction(db, async (transaction) => {
-                const fromUserRef = doc(db, "users", fromUserId);
-                const toUserRef = doc(db, "users", toUserId);
+            await runTransaction(db, async (tx) => {
+                const tradeSnap = await tx.get(tradeRef);
+                if (!tradeSnap.exists()) throw new Error('Deal not found');
+                const t = tradeSnap.data();
+                if (t.sellerId !== params.sellerId) {
+                    const actorSnap = await tx.get(doc(db, 'users', params.sellerId));
+                    const role = actorSnap.data()?.role;
+                    if (role !== 'worker' && role !== 'admin') {
+                        throw new Error('Only the seller or ReLoop staff can complete this deal');
+                    }
+                }
+                if (t.status === 'completed') throw new Error('This deal is already completed');
+                if (t.status !== 'accepted') throw new Error(`This deal is ${t.status}, not ready for pickup`);
 
-                const fromUserDoc = await transaction.get(fromUserRef);
-                const toUserDoc = await transaction.get(toUserRef);
+                const amount: number = t.agreedCoins || 0;
+                const buyerRef = doc(db, 'users', t.traderId);
+                const sellerRef = doc(db, 'users', t.sellerId);
+                const listingRef = doc(db, 'listings', t.listingId);
+                const [buyerSnap, sellerSnap, listingSnap] = await Promise.all([
+                    tx.get(buyerRef), tx.get(sellerRef), tx.get(listingRef)
+                ]);
+                if (!buyerSnap.exists() || !sellerSnap.exists()) throw new Error('One of the accounts no longer exists');
+                if (!listingSnap.exists()) throw new Error('The listing no longer exists');
 
-                if (!fromUserDoc.exists() || !toUserDoc.exists()) {
-                    throw new Error("One or both users not found");
+                const buyer = buyerSnap.data();
+                const seller = sellerSnap.data();
+                if ((buyer.coins || 0) < amount) {
+                    throw new Error('The buyer no longer has enough coins for this deal');
                 }
 
-                const fromUserData = fromUserDoc.data() as User;
-                const toUserData = toUserDoc.data() as User;
+                const co2PerTrade = 2.5;
+                tx.update(tradeRef, {
+                    status: 'completed',
+                    verifiedCode: code,
+                    completedAt: serverTimestamp(),
+                    updatedAt: serverTimestamp()
+                });
+                tx.update(buyerRef, {
+                    coins: (buyer.coins || 0) - amount,
+                    itemsTraded: (buyer.itemsTraded || 0) + 1,
+                    co2Saved: (buyer.co2Saved || 0) + co2PerTrade,
+                    lastTradeId: params.tradeId,
+                    updatedAt: serverTimestamp()
+                });
+                tx.update(sellerRef, {
+                    coins: (seller.coins || 0) + amount,
+                    itemsTraded: (seller.itemsTraded || 0) + 1,
+                    co2Saved: (seller.co2Saved || 0) + co2PerTrade,
+                    lastTradeId: params.tradeId,
+                    updatedAt: serverTimestamp()
+                });
+                tx.update(listingRef, { status: 'sold', soldAt: serverTimestamp(), updatedAt: serverTimestamp() });
 
-                const currentFromBalance = fromUserData.coins || 0;
-
-                if (currentFromBalance < amount) {
-                    throw new Error("Insufficient coins");
+                if (amount > 0) {
+                    tx.set(doc(collection(db, 'coinTransactions')), {
+                        userId: t.traderId, byUid: params.sellerId, amount: -amount,
+                        reason: `Bought "${t.listingTitle || 'item'}"`, refId: params.tradeId,
+                        createdAt: serverTimestamp()
+                    });
+                    tx.set(doc(collection(db, 'coinTransactions')), {
+                        userId: t.sellerId, byUid: params.sellerId, amount,
+                        reason: `Sold "${t.listingTitle || 'item'}"`, refId: params.tradeId,
+                        createdAt: serverTimestamp()
+                    });
                 }
+                tx.set(doc(collection(db, 'notifications')), {
+                    userId: t.traderId, fromUserId: params.sellerId, type: 'trade',
+                    title: 'Trade Complete! 🎉',
+                    message: `You picked up "${t.listingTitle || 'an item'}"${amount ? ` for ${amount} coins` : ''}. +${co2PerTrade}kg CO₂ saved!`,
+                    icon: 'check_circle', tradeId: params.tradeId, read: false, createdAt: serverTimestamp()
+                });
+                tx.set(doc(collection(db, 'notifications')), {
+                    userId: t.sellerId, fromUserId: params.sellerId, type: 'trade',
+                    title: 'Trade Complete! 🎉',
+                    message: `"${t.listingTitle || 'Your item'}" was picked up${amount ? ` — you received ${amount} coins` : ''}. +${co2PerTrade}kg CO₂ saved!`,
+                    icon: 'check_circle', tradeId: params.tradeId, read: false, createdAt: serverTimestamp()
+                });
 
-                const newFromBalance = currentFromBalance - amount;
-                const newToBalance = (toUserData.coins || 0) + amount;
-
-                transaction.update(fromUserRef, { coins: newFromBalance });
-                transaction.update(toUserRef, { coins: newToBalance });
+                result = { coins: amount, listingTitle: t.listingTitle || 'Item' };
             });
-
-            return { success: true };
         } catch (error) {
-            console.error("Error transferring coins:", error);
+            if (isPermissionDenied(error)) {
+                // The rules reject a wrong pickup code (the only part they check that the app can't).
+                throw new Error("That pickup code doesn't match. Ask the buyer to show their QR again.");
+            }
             throw error;
         }
+
+        await this.updateDailyMissionProgress(params.sellerId, 'tradesToday');
+        return result;
     },
 
     // NOTIFICATIONS
@@ -891,6 +1177,8 @@ export const DBService = {
         message: string;
         icon?: string;
         actionUrl?: string;
+        /** Required when notifying someone else: must be the signed-in user's uid. */
+        fromUserId?: string;
     }): Promise<string> {
         try {
             const docRef = await addDoc(collection(db, "notifications"), {
@@ -933,11 +1221,21 @@ export const DBService = {
         }
     },
 
-    async redeemReward(userId: string, rewardId: string, cost: number): Promise<{ success: boolean; redemptionId?: string; error?: string }> {
+    async redeemReward(userId: string, rewardId: string): Promise<{ success: boolean; redemptionId?: string; code?: string; error?: string }> {
         try {
             let redemptionId = '';
+            let code = '';
 
             await runTransaction(db, async (transaction) => {
+                // The price comes from the reward document, never from the caller.
+                const rewardRef = doc(db, "rewards", rewardId);
+                const rewardSnap = await transaction.get(rewardRef);
+                if (!rewardSnap.exists() || rewardSnap.data().isActive === false) {
+                    throw new Error('This reward is no longer available');
+                }
+                const cost: number = rewardSnap.data().cost;
+                if (!Number.isFinite(cost) || cost <= 0) throw new Error('This reward has an invalid price');
+
                 const userRef = doc(db, "users", userId);
                 const userDoc = await transaction.get(userRef);
                 const currentCoins = userDoc.data()?.coins || 0;
@@ -946,19 +1244,25 @@ export const DBService = {
                     throw new Error('Not enough coins');
                 }
 
-                // Deduct coins
-                transaction.update(userRef, { coins: currentCoins - cost });
+                transaction.update(userRef, { coins: currentCoins - cost, updatedAt: serverTimestamp() });
 
                 // Create redemption record
                 const redemptionRef = doc(collection(db, "redemptions"));
                 redemptionId = redemptionRef.id;
+                code = `RL-${generatePickupCode()}`;
                 transaction.set(redemptionRef, {
                     userId,
                     rewardId,
                     cost,
                     status: 'pending',
-                    code: `RL-${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
+                    code,
                     redeemedAt: serverTimestamp()
+                });
+
+                transaction.set(doc(collection(db, "coinTransactions")), {
+                    userId, byUid: userId, amount: -cost,
+                    reason: `Redeemed reward ${rewardSnap.data().title || rewardId}`,
+                    refId: redemptionRef.id, createdAt: serverTimestamp()
                 });
 
                 // Create notification
@@ -974,7 +1278,7 @@ export const DBService = {
                 });
             });
 
-            return { success: true, redemptionId };
+            return { success: true, redemptionId, code };
         } catch (error: any) {
             console.error("Error redeeming reward:", error);
             return { success: false, error: error.message };
@@ -1014,21 +1318,35 @@ export const DBService = {
     },
 
     // SCAN HISTORY
-    async createScan(userId: string, scanResult: any): Promise<string> {
-        try {
-            const docRef = await addDoc(collection(db, "scans"), {
+    /**
+     * Persist a scan and grant its XP once, atomically.
+     * (XP is bounded per scan; the AI result itself can't be trusted for anything bigger.)
+     */
+    async recordScan(userId: string, scanResult: any): Promise<{ scanId: string; xpEarned: number }> {
+        const xpEarned = Math.max(0, Math.min(15, Math.floor(Number(scanResult?.xpEarned) || 15)));
+        const scanRef = doc(collection(db, "scans"));
+        const userRef = doc(db, "users", userId);
+        await runTransaction(db, async (tx) => {
+            const userSnap = await tx.get(userRef);
+            const u = userSnap.data() || {};
+            const newXp = (u.xp || 0) + xpEarned;
+            tx.set(scanRef, {
                 userId,
                 item: scanResult.item,
                 classification: scanResult.classification,
-                xpEarned: scanResult.xpEarned || 0,
+                xpEarned,
                 claimed: false,
                 scannedAt: serverTimestamp()
             });
-            return docRef.id;
-        } catch (error) {
-            console.error("Error creating scan:", error);
-            throw error;
-        }
+            tx.update(userRef, {
+                xp: newXp,
+                level: Math.max(u.level || 1, levelFromXp(newXp)),
+                totalScans: (u.totalScans || 0) + 1,
+                updatedAt: serverTimestamp()
+            });
+        });
+        await this.updateDailyMissionProgress(userId, 'scansToday');
+        return { scanId: scanRef.id, xpEarned };
     },
 
     async getUserScans(userId: string): Promise<any[]> {
@@ -1051,51 +1369,27 @@ export const DBService = {
         }
     },
 
-    async claimScanCoins(userId: string, scanId: string, coins: number): Promise<boolean> {
-        try {
-            await runTransaction(db, async (transaction) => {
-                const scanRef = doc(db, "scans", scanId);
-                const scanDoc = await transaction.get(scanRef);
-
-                if (!scanDoc.exists() || scanDoc.data()?.claimed) {
-                    throw new Error('Scan already claimed or not found');
-                }
-
-                const userRef = doc(db, "users", userId);
-                const userDoc = await transaction.get(userRef);
-                const currentCoins = userDoc.data()?.coins || 0;
-
-                transaction.update(scanRef, { claimed: true, claimedAt: serverTimestamp() });
-                transaction.update(userRef, { coins: currentCoins + coins });
-            });
-            return true;
-        } catch (error) {
-            console.error("Error claiming scan coins:", error);
-            return false;
-        }
-    },
-
     // EXPIRED LISTINGS
     async getExpiredListings(userId: string): Promise<any[]> {
         try {
-            // Get listings older than 14 days that are still 'available'
-            const fourteenDaysAgo = new Date();
-            fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+            // Listings unsold after the 14-day window (dropped at a point, or just old)
+            const now = Date.now();
+            const fourteenDaysAgo = now - 14 * 24 * 60 * 60 * 1000;
 
             const q = query(
                 collection(db, "listings"),
-                where("seller.id", "==", userId),
-                where("status", "==", "available")
+                where("seller.id", "==", userId)
             );
             const snapshot = await getDocs(q);
 
-            // Filter by date client-side (Firestore doesn't support compound queries well)
             return snapshot.docs
-                .map(doc => ({ id: doc.id, ...doc.data() }))
-                .filter(listing => {
-                    const data = listing as any;
-                    const createdAt = data.createdAt?.toDate?.() || new Date();
-                    return createdAt < fourteenDaysAgo;
+                .map(d => ({ id: d.id, ...d.data() }))
+                .filter((listing: any) => {
+                    // Only unsold items can expire
+                    if (listing.status !== 'available' && listing.status !== 'at_point') return false;
+                    const expiresAt = toMillis(listing.expiresAt);
+                    if (expiresAt) return expiresAt < now;
+                    return (toMillis(listing.createdAt) || now) < fourteenDaysAgo;
                 });
         } catch (error) {
             console.error("Error fetching expired listings:", error);
@@ -1105,32 +1399,40 @@ export const DBService = {
 
     async handleEquityChoice(userId: string, listingId: string, choice: 'recycle' | 'donate'): Promise<{ success: boolean; coinsAwarded: number }> {
         try {
-            const listing = await this.getListingById(listingId);
-            if (!listing) {
-                throw new Error('Listing not found');
-            }
-
-            const baseCoins = Math.floor(listing.price * 0.1);
-            const bonusCoins = choice === 'donate' ? 10 : 0;
-            const totalCoins = baseCoins + bonusCoins;
+            let totalCoins = 0;
 
             await runTransaction(db, async (transaction) => {
-                // Update listing status
                 const listingRef = doc(db, "listings", listingId);
+                const listingSnap = await transaction.get(listingRef);
+                if (!listingSnap.exists()) throw new Error('Listing not found');
+                const listing = listingSnap.data();
+
+                // Ownership + one-shot guard: previously anyone could re-run this for
+                // unlimited coins because neither was checked.
+                if (listing.seller?.id !== userId) throw new Error('Not your listing');
+                if (listing.status !== 'available' && listing.status !== 'at_point') {
+                    throw new Error('This listing was already processed');
+                }
+
+                const baseCoins = Math.min(50, Math.floor((listing.price || 0) * 0.1));
+                totalCoins = baseCoins + (choice === 'donate' ? 10 : 0);
+
                 transaction.update(listingRef, {
                     status: choice === 'donate' ? 'donated' : 'recycled',
+                    equityChoice: choice,
                     equityProcessedAt: serverTimestamp()
                 });
 
-                // Add coins to user
                 const userRef = doc(db, "users", userId);
                 const userDoc = await transaction.get(userRef);
                 const currentCoins = userDoc.data()?.coins || 0;
-                transaction.update(userRef, { coins: currentCoins + totalCoins });
+                transaction.update(userRef, {
+                    coins: currentCoins + totalCoins,
+                    ...(choice === 'donate' ? { donationsMade: (userDoc.data()?.donationsMade || 0) + 1 } : {}),
+                    updatedAt: serverTimestamp()
+                });
 
-                // Create notification
-                const notifRef = doc(collection(db, "notifications"));
-                transaction.set(notifRef, {
+                transaction.set(doc(collection(db, "notifications")), {
                     userId,
                     type: 'coin',
                     title: choice === 'donate' ? 'Donation Complete! 💚' : 'Recycling Complete! ♻️',
@@ -1183,6 +1485,10 @@ export const DBService = {
             await runTransaction(db, async (transaction) => {
                 // Update listing status and location
                 const listingRef = doc(db, "listings", listingId);
+                const listingSnap = await transaction.get(listingRef);
+                if (!listingSnap.exists()) throw new Error('Listing not found');
+                if (listingSnap.data().seller?.id !== userId) throw new Error('Not your listing');
+                if (listingSnap.data().status !== 'available') throw new Error('This item can no longer be dropped off');
                 transaction.update(listingRef, {
                     status: 'at_point',
                     pointId,
@@ -1226,8 +1532,10 @@ export const DBService = {
                 transaction.update(userRef, {
                     coins: currentCoins + coinsAwarded,
                     xp: currentXp + xpEarned,
+                    level: Math.max(userDoc.data()?.level || 1, levelFromXp(currentXp + xpEarned)),
                     co2Saved: currentCo2 + co2PerRecycle,
-                    itemsRecycled: (userDoc.data()?.itemsRecycled || 0) + 1
+                    itemsRecycled: (userDoc.data()?.itemsRecycled || 0) + 1,
+                    updatedAt: serverTimestamp()
                 });
 
                 // Create recycling record
@@ -1262,6 +1570,37 @@ export const DBService = {
         }
     },
 
+
+    // ===== DONATIONS =====
+    /** Donate coins to a charity: balance drops and the donation is recorded, atomically. */
+    async donateCoins(userId: string, charityId: string, charityName: string, amount: number): Promise<{ success: boolean; error?: string }> {
+        try {
+            const coins = Math.floor(amount);
+            if (!Number.isFinite(coins) || coins <= 0) throw new Error('Enter a valid amount');
+            await runTransaction(db, async (tx) => {
+                const userRef = doc(db, "users", userId);
+                const snap = await tx.get(userRef);
+                const bal = snap.data()?.coins || 0;
+                if (bal < coins) throw new Error('Not enough coins');
+                tx.update(userRef, {
+                    coins: bal - coins,
+                    donationsMade: (snap.data()?.donationsMade || 0) + 1,
+                    updatedAt: serverTimestamp()
+                });
+                tx.set(doc(collection(db, "donations")), {
+                    userId, charityId, charityName, amount: coins, createdAt: serverTimestamp()
+                });
+                tx.set(doc(collection(db, "coinTransactions")), {
+                    userId, byUid: userId, amount: -coins, reason: `Donation to ${charityName}`,
+                    refId: charityId, createdAt: serverTimestamp()
+                });
+            });
+            return { success: true };
+        } catch (error: any) {
+            console.error("Error donating coins:", error);
+            return { success: false, error: error.message };
+        }
+    },
 
     // ===== LEADERBOARD =====
     async getLeaderboard(limitCount: number = 50): Promise<any[]> {
@@ -1393,7 +1732,7 @@ export const DBService = {
     },
 
     // Update mission progress (call when user scans, trades, fills bag, etc.)
-    async updateDailyMissionProgress(userId: string, trackingKey: string, increment: number = 1): Promise<boolean> {
+    async updateDailyMissionProgress(userId: string, trackingKey: string, amount: number = 1): Promise<boolean> {
         try {
             const today = this.getTodayString();
             const userMissionsRef = doc(db, "userDailyMissions", `${userId}_${today}`);
@@ -1411,7 +1750,7 @@ export const DBService = {
 
             const currentData = (await getDoc(userMissionsRef)).data();
             const currentProgress = currentData?.missions?.[matchingMission.id]?.progress || 0;
-            const newProgress = Math.min(currentProgress + increment, matchingMission.target);
+            const newProgress = Math.min(currentProgress + amount, matchingMission.target);
             const completed = newProgress >= matchingMission.target;
 
             await updateDoc(userMissionsRef, {
@@ -1467,7 +1806,7 @@ export const DBService = {
                 const userData = userDoc.data() || {};
                 const currentXp = userData.xp || 0;
                 const newXp = currentXp + xpReward;
-                const newLevel = Math.floor(newXp / 100) + 1;
+                const newLevel = Math.max(userData.level || 1, levelFromXp(newXp));
 
                 transaction.update(userRef, {
                     xp: newXp,

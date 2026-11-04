@@ -1,91 +1,111 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
-import { motion, AnimatePresence } from 'framer-motion';
+import { Suspense, useEffect, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { motion } from 'framer-motion';
 import { PageHeader } from '@/components/ui/PageHeader';
-import { useNavStore } from '@/lib/store/nav-store';
-import { ScanningOverlay } from '@/components/scanner/ScanningOverlay';
+import { QrScanner } from '@/components/scanner/QrScanner';
+import { useAuth } from '@/lib/contexts/AuthContext';
+import { DBService } from '@/lib/firebase/db';
+import { parsePickupQr, isValidPickupCode } from '@/lib/qr';
+import { Trade } from '@/types';
 
-const containerVariants = {
-    hidden: { opacity: 0 },
-    visible: { opacity: 1, transition: { staggerChildren: 0.1 } },
-};
-
-const itemVariants = {
-    hidden: { y: 15, opacity: 0 },
-    visible: { y: 0, opacity: 1, transition: { type: 'spring' as const, stiffness: 300, damping: 24 } },
-};
-
-const STEPS = [
-    { icon: 'handshake', title: 'Meet Up', desc: 'Meet the trader at the agreed location' },
-    { icon: 'check_circle', title: 'Inspect Item', desc: 'Check the item matches the listing' },
-    { icon: 'qr_code_scanner', title: 'Verify Trade', desc: 'Scan QR code or enter verification code' },
-];
-
-export default function VerifyTradePage() {
+/**
+ * Seller (or ReLoop staff) verifies a pickup: scan the buyer's QR, or type the 8-character
+ * code they show. Coins move only after the code is verified, in one atomic settlement.
+ */
+function VerifyTradeInner() {
     const router = useRouter();
-    const [code, setCode] = useState('');
-    const [step, setStep] = useState(0);
-    const [isVerifying, setIsVerifying] = useState(false);
-    const [verified, setVerified] = useState(false);
-    const [showScanner, setShowScanner] = useState(false);
-    const { setActions, reset } = useNavStore();
+    const search = useSearchParams();
+    const { user, isDemo, isLoading: authLoading } = useAuth();
 
-    // Register action when verified
+    const [trades, setTrades] = useState<Trade[]>([]);
+    const [tradeId, setTradeId] = useState<string>(search.get('trade') || '');
+    const [loading, setLoading] = useState(true);
+    const [cameraOn, setCameraOn] = useState(false);
+    const [manualCode, setManualCode] = useState('');
+    const [verifying, setVerifying] = useState(false);
+    const [error, setError] = useState('');
+    const [done, setDone] = useState<{ coins: number; listingTitle: string } | null>(null);
+
+    // Deals this user can verify: accepted deals where they are the seller.
     useEffect(() => {
-        if (verified) {
-            setActions({
-                label: 'Done',
-                onClick: () => router.push('/'),
-                icon: 'check',
-                variant: 'primary'
-            });
-        }
-        return () => reset();
-    }, [verified, router]);
+        if (authLoading) return;
+        if (isDemo || !user?.uid) { setLoading(false); return; }
+        DBService.getUserTrades(user.uid)
+            .then(all => setTrades(all.filter(t => t.status === 'accepted' && t.sellerId === user.uid)))
+            .catch(() => setError('Could not load your deals.'))
+            .finally(() => setLoading(false));
+    }, [authLoading, isDemo, user?.uid]);
 
-    const handleVerify = async () => {
-        if (!code) return;
-        setIsVerifying(true);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        setVerified(true);
-        setIsVerifying(false);
+    const settle = async (id: string, code: string) => {
+        if (!user?.uid || verifying) return;
+        setVerifying(true);
+        setError('');
+        try {
+            const result = await DBService.completeTrade({ tradeId: id, code, sellerId: user.uid });
+            setDone(result);
+        } catch (e: any) {
+            setError(e?.message || 'Could not verify this pickup.');
+        } finally {
+            setVerifying(false);
+        }
     };
 
-    // Simulate QR scan completion
-    useEffect(() => {
-        if (showScanner) {
-            const timer = setTimeout(() => {
-                setShowScanner(false);
-                setCode('RELOOP-8821');
-                // Auto verify after scan
-                setTimeout(() => handleVerify(), 500);
-            }, 3500);
-            return () => clearTimeout(timer);
+    const onScan = (text: string) => {
+        setCameraOn(false);
+        const parsed = parsePickupQr(text);
+        if (!parsed) {
+            setError("That isn't a ReLoop pickup QR. Ask the buyer to open their pickup QR.");
+            return;
         }
-    }, [showScanner]);
+        if (tradeId && parsed.tradeId !== tradeId) {
+            setError('This QR is for a different deal. Pick the right deal or scan again.');
+            return;
+        }
+        setTradeId(parsed.tradeId);
+        void settle(parsed.tradeId, parsed.code);
+    };
 
-    if (verified) {
+    const onManual = () => {
+        if (!tradeId) { setError('Choose which deal you are verifying first.'); return; }
+        if (!isValidPickupCode(manualCode)) { setError('The code is 8 letters/numbers.'); return; }
+        void settle(tradeId, manualCode.trim().toUpperCase());
+    };
+
+    if (done) {
         return (
-            <div className="min-h-screen bg-gradient-to-b from-green-100 to-white flex flex-col items-center justify-center px-8">
+            <div className="min-h-screen bg-gradient-to-b from-green-100 to-white dark:from-dark-bg dark:to-dark-surface flex flex-col items-center justify-center px-8">
                 <motion.div
                     initial={{ scale: 0, rotate: -180 }}
                     animate={{ scale: 1, rotate: 0 }}
-                    transition={{ type: 'spring' as const, stiffness: 200, damping: 15 }}
-                    className="w-32 h-32 bg-primary rounded-[2.5rem] border-[3px] border-dark dark:border-gray-600 shadow-brutal flex items-center justify-center mb-6"
+                    transition={{ type: 'spring', stiffness: 200, damping: 15 }}
+                    className="w-32 h-32 bg-primary rounded-[2.5rem] border-[3px] border-dark shadow-brutal flex items-center justify-center mb-6"
                 >
-                    <span className="material-symbols-outlined text-6xl text-dark dark:text-white">verified</span>
+                    <span className="material-symbols-outlined text-6xl text-dark">verified</span>
                 </motion.div>
-                <motion.div
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.4 }}
-                    className="text-center"
+                <h1 className="text-3xl font-[900] text-dark dark:text-white uppercase text-center">Trade Verified!</h1>
+                <p className="text-dark/60 dark:text-white/60 mt-2 text-center">
+                    &quot;{done.listingTitle}&quot; picked up.
+                    {done.coins > 0 ? ` ${done.coins} coins moved from the buyer to you.` : ' Item swap complete.'}
+                </p>
+                <button
+                    onClick={() => router.push('/trade-history')}
+                    className="mt-8 w-full max-w-xs bg-dark text-white py-4 rounded-2xl font-black uppercase shadow-brutal"
                 >
-                    <h1 className="text-3xl font-[900] text-dark dark:text-white uppercase">Trade Verified!</h1>
-                    <p className="text-dark/60 dark:text-white/60 mt-2">Eco Coins have been transferred successfully</p>
-                </motion.div>
+                    Done
+                </button>
+            </div>
+        );
+    }
+
+    if (isDemo) {
+        return (
+            <div className="min-h-screen bg-background">
+                <PageHeader title="Verify Trade" backHref="/trade-history" />
+                <p className="px-5 text-sm text-dark/70 dark:text-white/70">
+                    Trade verification needs a real account (it checks the buyer&apos;s QR against the database). Sign in to use it.
+                </p>
             </div>
         );
     }
@@ -93,111 +113,88 @@ export default function VerifyTradePage() {
     return (
         <div className="min-h-screen bg-background">
             <PageHeader title="Verify Trade" backHref="/trade-history" />
-
-            <motion.div
-                className="px-5 pb-28 space-y-6"
-                initial="hidden"
-                animate="visible"
-                variants={containerVariants}
-            >
-                {/* Steps */}
-                <motion.div variants={itemVariants} className="space-y-3">
-                    {STEPS.map((s, i) => (
-                        <div
-                            key={i}
-                            className={`rounded-2xl border-2 p-4 flex items-center gap-4 transition-all ${i <= step
-                                ? 'bg-card-green border-dark dark:border-gray-600 shadow-brutal-sm'
-                                : 'bg-white dark:bg-dark-surface border-gray-200 dark:border-gray-700 opacity-50'
-                                }`}
-                        >
-                            <div className={`w-12 h-12 rounded-xl border-2 border-dark dark:border-gray-600 flex items-center justify-center ${i < step ? 'bg-primary' : 'bg-white dark:bg-dark-surface'}`}>
-                                {i < step ? (
-                                    <span className="material-symbols-outlined text-dark dark:text-white">check</span>
-                                ) : (
-                                    <span className="material-symbols-outlined text-dark dark:text-white">{s.icon}</span>
-                                )}
-                            </div>
-                            <div>
-                                <p className="font-bold text-dark dark:text-white text-sm">{s.title}</p>
-                                <p className="text-xs text-dark/60 dark:text-white/60">{s.desc}</p>
-                            </div>
-                        </div>
-                    ))}
-                </motion.div>
-
-                {/* Progress Buttons */}
-                {step < 2 && (
-                    <motion.div variants={itemVariants}>
-                        <button
-                            onClick={() => setStep(step + 1)}
-                            className="w-full bg-primary text-dark py-4 rounded-2xl font-bold border-2 border-dark dark:border-gray-600 shadow-brutal active:translate-y-1 active:shadow-none transition-all"
-                        >
-                            {step === 0 ? 'I\'ve Met the Trader' : 'Item Looks Good'}
-                        </button>
-                    </motion.div>
-                )}
-
-                {/* Verification Code */}
-                {step === 2 && (
-                    <motion.div variants={itemVariants} className="space-y-4">
-                        <div className="bg-white dark:bg-dark-surface rounded-2xl border-2 border-dark dark:border-gray-600 shadow-brutal-sm p-5">
-                            <p className="font-bold text-dark dark:text-white text-sm mb-3">Enter Verification Code</p>
-                            <input
-                                type="text"
-                                value={code}
-                                onChange={(e) => setCode(e.target.value.toUpperCase())}
-                                placeholder="e.g., RELOOP-1234"
-                                maxLength={12}
-                                className="w-full h-16 rounded-2xl bg-gray-100 dark:bg-dark-surface border-2 border-dark dark:border-gray-600 px-5 text-2xl font-black text-center tracking-widest uppercase placeholder:text-gray-300 placeholder:text-lg focus:outline-none focus:ring-2 focus:ring-primary"
-                            />
-                            <p className="text-xs text-dark/40 dark:text-white/40 mt-2 text-center">Ask the other trader for their code</p>
+            <div className="px-5 pb-28 space-y-5">
+                {loading ? (
+                    <div className="flex justify-center py-10"><div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin" /></div>
+                ) : trades.length === 0 ? (
+                    <div className="text-center py-10">
+                        <span className="material-symbols-outlined text-5xl text-dark/30 dark:text-white/30">inventory_2</span>
+                        <p className="font-bold text-dark dark:text-white mt-2">No accepted deals waiting for pickup</p>
+                        <p className="text-sm text-dark/60 dark:text-white/60 mt-1">Accept an offer first, then verify it when the buyer arrives.</p>
+                    </div>
+                ) : (
+                    <>
+                        <div className="space-y-2">
+                            <p className="text-sm font-bold text-dark/60 dark:text-white/60">Which deal?</p>
+                            {trades.map(t => (
+                                <button
+                                    key={t.id}
+                                    onClick={() => { setTradeId(t.id); setError(''); }}
+                                    className={`w-full text-left rounded-2xl border-2 p-4 ${tradeId === t.id ? 'bg-card-green border-dark shadow-brutal-sm' : 'bg-white dark:bg-dark-surface border-gray-200 dark:border-gray-700'}`}
+                                >
+                                    <p className="font-black text-dark dark:text-white">{t.listingTitle}</p>
+                                    <p className="text-xs text-dark/60 dark:text-white/60">
+                                        {t.traderName} · {t.agreedCoins ? `🪙 ${t.agreedCoins}` : t.offeredItem ? `swap: ${t.offeredItem}` : 'free'}
+                                    </p>
+                                </button>
+                            ))}
                         </div>
 
-                        <button
-                            onClick={handleVerify}
-                            disabled={!code || isVerifying}
-                            className="w-full bg-dark text-white py-5 rounded-2xl font-[900] uppercase tracking-wider shadow-brutal disabled:opacity-50 active:translate-y-1 active:shadow-none transition-all flex items-center justify-center gap-3"
-                        >
-                            {isVerifying ? (
-                                <div className="w-6 h-6 border-3 border-white border-t-transparent rounded-full animate-spin" />
+                        <div className="relative w-full aspect-square bg-dark rounded-3xl border-4 border-dark shadow-brutal overflow-hidden flex items-center justify-center">
+                            {cameraOn ? (
+                                <QrScanner onScan={onScan} onError={(m) => { setCameraOn(false); setError(m); }} />
                             ) : (
-                                <>
-                                    <span className="material-symbols-outlined">verified</span>
-                                    Verify Trade
-                                </>
+                                <div className="text-center px-6">
+                                    <span className="material-symbols-outlined text-6xl text-white/40">videocam_off</span>
+                                    <p className="text-white/60 text-sm font-bold">Camera is off</p>
+                                </div>
                             )}
-                        </button>
-                    </motion.div>
-                )}
+                        </div>
 
-                {/* QR Alternative */}
-                {step === 2 && (
-                    <motion.div variants={itemVariants} className="text-center">
-                        <p className="text-dark/40 dark:text-white/40 text-sm mb-3">or</p>
                         <button
-                            onClick={() => setShowScanner(true)}
-                            className="px-6 py-3 bg-white dark:bg-dark-surface border-2 border-dark dark:border-gray-600 rounded-full font-bold text-dark dark:text-white shadow-brutal-sm active:scale-95 transition-transform flex items-center gap-2 mx-auto"
+                            onClick={() => { setError(''); setCameraOn(c => !c); }}
+                            disabled={verifying}
+                            className="w-full bg-primary text-dark py-4 rounded-2xl font-black border-2 border-dark shadow-brutal flex items-center justify-center gap-2 disabled:opacity-50"
                         >
-                            <span className="material-symbols-outlined text-lg">qr_code_scanner</span>
-                            Scan QR Code
+                            <span className="material-symbols-outlined">{cameraOn ? 'stop_circle' : 'qr_code_scanner'}</span>
+                            {cameraOn ? 'Stop Camera' : "Scan Buyer's QR"}
                         </button>
-                    </motion.div>
-                )}
-            </motion.div>
 
-            {/* Full Screen Scanner Overlay */}
-            <AnimatePresence>
-                {showScanner && (
-                    <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="fixed inset-0 z-50"
-                    >
-                        <ScanningOverlay onCancel={() => setShowScanner(false)} />
-                    </motion.div>
+                        <div>
+                            <p className="text-xs font-bold text-dark/50 dark:text-white/50 mb-2">Or enter the buyer&apos;s code</p>
+                            <div className="flex gap-2">
+                                <input
+                                    value={manualCode}
+                                    onChange={(e) => setManualCode(e.target.value.toUpperCase())}
+                                    maxLength={8}
+                                    placeholder="8-CHAR CODE"
+                                    className="flex-1 h-14 rounded-2xl bg-white dark:bg-dark-surface border-2 border-dark px-4 text-xl font-black text-center tracking-widest uppercase text-dark dark:text-white"
+                                />
+                                <button
+                                    onClick={onManual}
+                                    disabled={verifying || manualCode.length !== 8}
+                                    className="px-5 bg-dark text-white rounded-2xl font-black disabled:opacity-50"
+                                >
+                                    {verifying ? '…' : 'Verify'}
+                                </button>
+                            </div>
+                        </div>
+                    </>
                 )}
-            </AnimatePresence>
+
+                {error && (
+                    <div className="bg-card-coral text-dark p-3 rounded-xl text-sm font-bold border-2 border-dark">⚠️ {error}</div>
+                )}
+                {verifying && <p className="text-center text-sm font-bold text-dark/60 dark:text-white/60">Verifying…</p>}
+            </div>
         </div>
+    );
+}
+
+export default function VerifyTradePage() {
+    return (
+        <Suspense fallback={null}>
+            <VerifyTradeInner />
+        </Suspense>
     );
 }

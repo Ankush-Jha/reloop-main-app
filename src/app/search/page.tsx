@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import { DBService } from '@/lib/firebase/db';
+import { useAuth } from '@/lib/contexts/AuthContext';
 import DemoManager from '@/lib/demo-manager';
 import { Listing } from '@/types';
 import { PageHeader } from '@/components/ui/PageHeader';
@@ -23,6 +24,7 @@ const RECENT_SEARCHES = ['Textbooks', 'Denim Jacket', 'Headphones', 'Plants'];
 const TRENDING = ['Electronics', 'Books', 'Clothing', 'Furniture'];
 
 export default function SearchPage() {
+    const { isDemo, isLoading: authLoading } = useAuth();
     const [query, setQuery] = useState('');
     const [allListings, setAllListings] = useState<Listing[]>([]);
     const [results, setResults] = useState<Listing[]>([]);
@@ -37,23 +39,19 @@ export default function SearchPage() {
 
     // Load listings on mount
     useEffect(() => {
+        if (authLoading) return;
         const loadListings = async () => {
             setIsLoading(true);
             try {
-                const firebaseListings = await DBService.getListings();
-                if (firebaseListings.length > 0) {
-                    setAllListings(firebaseListings);
-                } else {
-                    setAllListings(DemoManager.getMockListings());
-                }
+                setAllListings(isDemo ? DemoManager.getMockListings() : await DBService.getListings());
             } catch (error) {
                 console.error('Error loading listings:', error);
-                setAllListings(DemoManager.getMockListings());
+                setAllListings(isDemo ? DemoManager.getMockListings() : []);
             }
             setIsLoading(false);
         };
         loadListings();
-    }, []);
+    }, [isDemo, authLoading]);
 
     // Search effect
     useEffect(() => {

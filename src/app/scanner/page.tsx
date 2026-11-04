@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import dynamic from 'next/dynamic';
 import ScannerService from '@/lib/scanner-service';
+import { DBService } from '@/lib/firebase/db';
 import { useAuth } from '@/lib/contexts/AuthContext';
 import { useNavStore } from '@/lib/store/nav-store';
 import { ScanningOverlay } from '@/components/scanner/ScanningOverlay';
@@ -22,7 +23,7 @@ type CameraState = 'idle' | 'requesting' | 'ready' | 'denied' | 'error';
 
 export default function ScannerPage() {
     const router = useRouter();
-    const { user } = useAuth();
+    const { user, isDemo } = useAuth();
     const webcamRef = useRef<WebcamCaptureRef>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -80,6 +81,9 @@ export default function ScannerPage() {
             const result = await ScannerService.analyzeImage(imageSrc);
 
             if (result.success) {
+                if (user?.uid && !isDemo) {
+                    try { await DBService.recordScan(user.uid, result); } catch (e) { console.error('Could not save scan:', e); }
+                }
                 const params = new URLSearchParams();
                 params.set('result', JSON.stringify(result));
                 router.push(`/scanner/ideas?${params.toString()}`);
@@ -88,7 +92,7 @@ export default function ScannerPage() {
             }
         } catch (err) {
             console.error('Scan error:', err);
-            setErrorMessage('An error occurred. Please try again.');
+            setErrorMessage((err as Error)?.message || 'An error occurred. Please try again.');
         } finally {
             setIsAnalyzing(false);
         }
@@ -137,6 +141,9 @@ export default function ScannerPage() {
                 const result = await ScannerService.analyzeImage(imageSrc);
 
                 if (result.success) {
+                    if (user?.uid && !isDemo) {
+                        try { await DBService.recordScan(user.uid, result); } catch (e) { console.error('Could not save scan:', e); }
+                    }
                     const params = new URLSearchParams();
                     params.set('result', JSON.stringify(result));
                     router.push(`/scanner/ideas?${params.toString()}`);

@@ -1,6 +1,5 @@
 import { db } from './firebase/client';
 import {
-    collection,
     doc,
     getDoc,
     setDoc,
@@ -78,7 +77,7 @@ export const ScrapPriceService = {
 
                 // Use cache if less than 24 hours old
                 if (hoursSinceFetch < 24) {
-                    return data.prices.map(p => ({
+                    return (data.prices as Array<Omit<ScrapPrice, 'lastUpdated'> & { lastUpdated: string }>).map(p => ({
                         ...p,
                         lastUpdated: new Date(p.lastUpdated)
                     }));

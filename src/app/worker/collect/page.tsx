@@ -1,121 +1,93 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useRouter } from 'next/navigation';
 import { DBService } from '@/lib/firebase/db';
 import { useAuth } from '@/lib/contexts/AuthContext';
 import DemoManager from '@/lib/demo-manager';
+import { QrScanner } from '@/components/scanner/QrScanner';
+import { normalizeBagCode, bagPayout, BAG_MAX_WEIGHT_KG } from '@/lib/qr';
 
 export default function WorkerCollectPage() {
     const router = useRouter();
     const { user, isDemo, isLoading: authLoading } = useAuth();
     const [step, setStep] = useState<'scan' | 'weigh' | 'confirm' | 'success'>('scan');
-    const [scanning, setScanning] = useState(false);
+    const [cameraOn, setCameraOn] = useState(false);
     const [scannedBag, setScannedBag] = useState<any | null>(null);
     const [weight, setWeight] = useState('');
     const [confirming, setConfirming] = useState(false);
     const [coinsAwarded, setCoinsAwarded] = useState(0);
-    const [allBags, setAllBags] = useState<any[]>([]);
+    const [manualCode, setManualCode] = useState('');
+    const [error, setError] = useState('');
 
-    // Load all bags on mount
-    useEffect(() => {
-        // Wait for auth to finish loading before fetching data
-        if (authLoading) return;
+    // Only staff may collect bags (role is set in the Firebase console). Demo mode is open.
+    const isStaff = isDemo || user?.role === 'worker' || user?.role === 'admin';
 
-        const loadBags = async () => {
-            try {
-                if (isDemo) {
-                    // Demo mode - use mock data
-                    setAllBags(DemoManager.getAllSmartBags());
-                } else if (user?.uid) {
-                    // Firebase mode
-                    const bags = await DBService.getUserSmartBags(user.uid);
-                    setAllBags(bags);
-                }
-            } catch (error) {
-                console.error('Error loading bags:', error);
-                setAllBags(DemoManager.getAllSmartBags());
-            }
-        };
-        loadBags();
-    }, [user, isDemo, authLoading]);
+    const weightKg = Math.round((parseFloat(weight) || 0) * 10) / 10;
+    const validWeight = weightKg > 0 && weightKg <= BAG_MAX_WEIGHT_KG;
 
-    const handleScan = async () => {
-        setScanning(true);
+    // A QR code (camera or typed) was read: look the bag up for real.
+    const handleCode = async (raw: string) => {
+        setCameraOn(false);
+        setError('');
 
-        try {
-            if (!isDemo) {
-                // Simulate scanning - in real app this would use camera
-                await new Promise(resolve => setTimeout(resolve, 1500));
-
-                // Find a filled bag from Firebase
-                const filledBag = allBags.find(b => b.status === 'filled');
-                if (filledBag) {
-                    setScannedBag(filledBag);
-                    setStep('weigh');
-                } else {
-                    alert('No filled bags available. Please mark a bag as filled first.');
-                }
-            } else {
-                await DemoManager.simulateDelay(1500);
-                const demoBags = DemoManager.getAllSmartBags();
-                const filledBag = demoBags.find(b => b.status === 'filled');
-
-                if (filledBag) {
-                    setScannedBag(filledBag);
-                    setStep('weigh');
-                } else {
-                    alert('No filled bags available for demo. Please mark a bag as filled first.');
-                }
-            }
-        } catch (error) {
-            console.error('Error scanning:', error);
-            alert('An error occurred while scanning.');
+        const code = normalizeBagCode(raw);
+        if (!code) {
+            setError("That QR isn't a ReLoop bag code. Try again.");
+            return;
         }
 
-        setScanning(false);
+        try {
+            const bag = isDemo
+                ? DemoManager.getAllSmartBags().find(b => b.qrCode === code)
+                : await DBService.getSmartBagByQR(code);
+
+            if (!bag) {
+                setError(`No registered bag found for ${code}.`);
+            } else if (bag.status === 'processed' || bag.status === 'collected') {
+                setError('This bag was already collected.');
+            } else if (bag.status !== 'filled') {
+                setError("This bag hasn't been marked as filled by its owner yet.");
+            } else if (!isDemo && bag.ownerId === user?.uid) {
+                setError("You can't collect your own bag.");
+            } else {
+                setScannedBag(bag);
+                setStep('weigh');
+            }
+        } catch (e) {
+            console.error('Bag lookup failed:', e);
+            setError('Could not look up this bag. Check your connection and permissions.');
+        }
     };
 
     const handleWeighSubmit = () => {
-        if (parseFloat(weight) > 0) {
-            setStep('confirm');
-        }
+        if (validWeight) setStep('confirm');
     };
 
     const handleConfirm = async () => {
-        if (!scannedBag || !weight) return;
-
+        if (!scannedBag || !validWeight || confirming) return;
         setConfirming(true);
+        setError('');
 
         try {
-            const weightKg = parseFloat(weight);
-            const coins = Math.floor(weightKg * 10);
-
-            if (!isDemo && scannedBag.userId) {
-                // Update bag status in Firebase
-                await DBService.updateSmartBagStatus(scannedBag.id, 'collected');
-
-                // Add coins to bag owner
-                await DBService.addCoinsToUser(scannedBag.userId, coins, 'Smart bag collection');
-
-                setCoinsAwarded(coins);
-                setStep('success');
-            } else {
-                await DemoManager.simulateDelay(1500);
+            if (isDemo) {
+                await DemoManager.simulateDelay(800);
                 const result = DemoManager.collectSmartBag(scannedBag.qrCode, weightKg);
-
-                if (result.success) {
-                    setCoinsAwarded(result.coinsAwarded || 0);
-                    setStep('success');
-                }
+                if (!result.success) throw new Error('Demo collection failed');
+                setCoinsAwarded(result.coinsAwarded || 0);
+            } else {
+                if (!user?.uid) throw new Error('Not signed in');
+                const result = await DBService.collectSmartBag(scannedBag.id, user.uid, weightKg);
+                setCoinsAwarded(result.coinsAwarded);
             }
-        } catch (error) {
-            console.error('Error confirming collection:', error);
-            alert('An error occurred. Please try again.');
+            setStep('success');
+        } catch (e: any) {
+            console.error('Error confirming collection:', e);
+            setError(e?.message || 'Something went wrong. Please try again.');
+        } finally {
+            setConfirming(false);
         }
-
-        setConfirming(false);
     };
 
     const resetFlow = () => {
@@ -123,7 +95,36 @@ export default function WorkerCollectPage() {
         setScannedBag(null);
         setWeight('');
         setCoinsAwarded(0);
+        setManualCode('');
+        setError('');
+        setCameraOn(false);
     };
+
+    if (authLoading) {
+        return (
+            <div className="min-h-screen bg-background flex items-center justify-center">
+                <div className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+            </div>
+        );
+    }
+
+    if (!isStaff) {
+        return (
+            <div className="min-h-screen bg-background flex flex-col items-center justify-center p-6 text-center">
+                <span className="material-symbols-outlined text-6xl text-dark/30 dark:text-white/30 mb-4">lock</span>
+                <h1 className="text-xl font-black text-dark dark:text-white mb-2">Workers only</h1>
+                <p className="text-sm text-dark/60 dark:text-white/60 max-w-xs mb-6">
+                    Bag collection is limited to ReLoop collection staff.
+                </p>
+                <button
+                    onClick={() => router.push('/smart-bags')}
+                    className="bg-primary text-dark font-black px-6 py-3 rounded-xl border-2 border-dark shadow-brutal-sm"
+                >
+                    Back to my bags
+                </button>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen bg-background flex flex-col">
@@ -149,28 +150,61 @@ export default function WorkerCollectPage() {
                             className="w-full max-w-md text-center"
                         >
                             <div className="w-full aspect-square bg-dark rounded-3xl border-4 border-dark shadow-brutal mb-6 flex items-center justify-center relative overflow-hidden">
-                                <motion.div
-                                    animate={{ scale: [1, 1.1, 1], opacity: [0.5, 0.8, 0.5] }}
-                                    transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
-                                    className="w-48 h-48 border-4 border-green-400 rounded-2xl"
-                                />
+                                {cameraOn ? (
+                                    <QrScanner
+                                        onScan={handleCode}
+                                        onError={(msg) => { setCameraOn(false); setError(msg); }}
+                                    />
+                                ) : (
+                                    <div className="text-center px-6">
+                                        <span className="material-symbols-outlined text-6xl text-white/40 mb-2">videocam_off</span>
+                                        <p className="text-white/60 text-sm font-bold">Camera is off</p>
+                                    </div>
+                                )}
                             </div>
 
                             <p className="text-lg font-black text-dark dark:text-white mb-2">
-                                {scanning ? 'Scanning QR...' : 'Scan Bag QR Code'}
+                                {cameraOn ? 'Scanning...' : 'Scan Bag QR Code'}
                             </p>
-                            <p className="text-sm text-dark/60 dark:text-white/60 mb-6 max-w-xs mx-auto">
-                                Position the QR code on the smart bag within the frame
+                            <p className="text-sm text-dark/60 dark:text-white/60 mb-4 max-w-xs mx-auto">
+                                {cameraOn
+                                    ? 'Point the camera at the QR code on the smart bag'
+                                    : 'Turn on the camera and point it at the QR code on the smart bag'}
                             </p>
 
+                            {error && (
+                                <div className="bg-card-coral text-dark p-3 rounded-xl mb-4 text-sm font-bold border-2 border-dark">
+                                    ⚠️ {error}
+                                </div>
+                            )}
+
                             <button
-                                onClick={handleScan}
-                                disabled={scanning}
-                                className="w-full bg-green-500 text-white font-black py-4 rounded-2xl border-2 border-dark shadow-brutal flex items-center justify-center gap-2 active:translate-y-0.5 transition-transform disabled:opacity-50"
+                                onClick={() => { setError(''); setCameraOn(c => !c); }}
+                                className="w-full bg-green-500 text-white font-black py-4 rounded-2xl border-2 border-dark shadow-brutal flex items-center justify-center gap-2 active:translate-y-0.5 transition-transform"
                             >
-                                <span className="material-symbols-outlined">qr_code_scanner</span>
-                                {scanning ? 'Scanning...' : 'Scan QR Code'}
+                                <span className="material-symbols-outlined">{cameraOn ? 'stop_circle' : 'qr_code_scanner'}</span>
+                                {cameraOn ? 'Stop Camera' : 'Start Camera'}
                             </button>
+
+                            <div className="mt-6">
+                                <p className="text-xs font-bold text-dark/50 dark:text-white/50 mb-2">Or enter the bag code manually</p>
+                                <div className="flex gap-2">
+                                    <input
+                                        type="text"
+                                        value={manualCode}
+                                        onChange={(e) => setManualCode(e.target.value.toUpperCase())}
+                                        placeholder="e.g. BAG-ABC123"
+                                        className="flex-1 px-4 py-3 rounded-xl border-2 border-dark dark:border-gray-600 bg-white dark:bg-dark-surface font-bold text-dark dark:text-white"
+                                    />
+                                    <button
+                                        onClick={() => handleCode(manualCode)}
+                                        disabled={!manualCode.trim()}
+                                        className="px-4 py-3 bg-primary text-dark font-black rounded-xl border-2 border-dark shadow-brutal-sm disabled:opacity-50"
+                                    >
+                                        Go
+                                    </button>
+                                </div>
+                            </div>
                         </motion.div>
                     )}
 
@@ -209,6 +243,8 @@ export default function WorkerCollectPage() {
                                 <input
                                     type="number"
                                     step="0.1"
+                                    min="0"
+                                    max={BAG_MAX_WEIGHT_KG}
                                     value={weight}
                                     onChange={(e) => setWeight(e.target.value)}
                                     placeholder="0.0"
@@ -220,7 +256,7 @@ export default function WorkerCollectPage() {
                             <div className="space-y-3">
                                 <button
                                     onClick={handleWeighSubmit}
-                                    disabled={!weight || parseFloat(weight) <= 0}
+                                    disabled={!validWeight}
                                     className="w-full bg-green-500 text-white font-black py-4 rounded-2xl border-2 border-dark shadow-brutal flex items-center justify-center gap-2 active:translate-y-0.5 transition-transform disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     <span className="material-symbols-outlined">arrow_forward</span>
@@ -261,13 +297,19 @@ export default function WorkerCollectPage() {
                                 </div>
                                 <div className="flex justify-between">
                                     <span className="text-sm text-dark/60 dark:text-white/60">Weight</span>
-                                    <span className="text-sm font-bold text-dark dark:text-white">{parseFloat(weight).toFixed(1)} kg</span>
+                                    <span className="text-sm font-bold text-dark dark:text-white">{weightKg.toFixed(1)} kg</span>
                                 </div>
                                 <div className="flex justify-between items-center pt-4 border-t-2 border-dashed border-dark/10">
                                     <span className="text-sm text-dark/60 dark:text-white/60">Coins to Award</span>
-                                    <span className="text-3xl font-black text-green-600 dark:text-green-400">+{Math.floor(parseFloat(weight) * 10)}</span>
+                                    <span className="text-3xl font-black text-green-600 dark:text-green-400">+{bagPayout(weightKg)}</span>
                                 </div>
                             </div>
+
+                            {error && (
+                                <div className="bg-card-coral text-dark p-3 rounded-xl mb-4 text-sm font-bold border-2 border-dark">
+                                    ⚠️ {error}
+                                </div>
+                            )}
 
                             <div className="space-y-3">
                                 <button

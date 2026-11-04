@@ -100,14 +100,10 @@ export default function MarketplacePage() {
                 }
             });
         } else {
-            // Poll Firebase every 5 seconds for real-time updates
-            pollInterval = setInterval(() => {
-                if (mounted) {
-                    DBService.getListings().then(data => {
-                        if (mounted) setListings(data);
-                    });
-                }
-            }, 5000);
+            // Realtime feed: only changed documents are sent (was: full re-download every 5s).
+            unsubscribe = DBService.subscribeToListings((data) => {
+                if (mounted) { setListings(data); setIsLoading(false); }
+            });
         }
 
         return () => {

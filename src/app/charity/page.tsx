@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence, useMotionValue, useTransform, animate } from 'framer-motion';
 import DemoManager from '@/lib/demo-manager';
+import { useAuth } from '@/lib/contexts/AuthContext';
+import { DBService } from '@/lib/firebase/db';
 import { PageHeader } from '@/components/ui/PageHeader';
 import { formatRupeeValue, coinsToRupees } from '@/lib/eco-coins';
 
@@ -686,6 +688,7 @@ function TopDonors() {
 }
 
 export default function GiveBackPage() {
+    const { user: authUser, isDemo } = useAuth();
     const [userCoins, setUserCoins] = useState(DemoManager.user.coins);
     const [charities, setCharities] = useState<any[]>([]);
     const [stats, setStats] = useState<any>(null);
@@ -700,15 +703,29 @@ export default function GiveBackPage() {
         setCharities(DemoManager.getCharityGoals());
         setStats(DemoManager.getGiveBackStats());
         setStories(DemoManager.getCharityStories());
-        setUserCoins(DemoManager.user.coins);
-    }, []);
+        if (isDemo) setUserCoins(DemoManager.user.coins);
+    }, [isDemo]);
+
+    // Real users: show and spend their real balance (it used to show/spend the demo balance).
+    useEffect(() => {
+        if (!isDemo && authUser) setUserCoins(authUser.coins);
+    }, [isDemo, authUser]);
 
     const handleDonate = async (amount: number) => {
         if (!selectedCharity || userCoins < amount) return;
         setDonating(true);
-        await DemoManager.simulateDelay(600);
 
-        const result = DemoManager.donateToCharity(selectedCharity.id, amount);
+        let result: { success: boolean; remainingCoins: number };
+        if (isDemo) {
+            await DemoManager.simulateDelay(600);
+            result = DemoManager.donateToCharity(selectedCharity.id, amount);
+        } else if (authUser?.uid) {
+            const r = await DBService.donateCoins(authUser.uid, selectedCharity.id, selectedCharity.name, amount);
+            if (!r.success) alert(r.error || 'Donation failed');
+            result = { success: r.success, remainingCoins: userCoins - amount };
+        } else {
+            result = { success: false, remainingCoins: userCoins };
+        }
         if (result.success) {
             setUserCoins(result.remainingCoins);
             setTotalDonated(prev => prev + amount);
